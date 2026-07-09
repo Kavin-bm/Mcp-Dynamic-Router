@@ -92,7 +92,7 @@ func (s *Session) Submit(parent context.Context, event Event) bool {
 		defer s.wait.Done()
 		prediction, err := s.route(ctx, generation, event)
 		if err != nil {
-			if ctx.Err() == nil && s.hooks.OnError != nil {
+			if err != errStaleGeneration && ctx.Err() == nil && s.hooks.OnError != nil {
 				s.hooks.OnError(err)
 			}
 			return
@@ -113,6 +113,9 @@ func (s *Session) Update(parent context.Context, event Event) (Prediction, error
 		return Prediction{}, fmt.Errorf("stream RAG session is closed")
 	}
 	prediction, err := s.route(ctx, generation, event)
+	if err == errStaleGeneration {
+		return Prediction{Triggered: false, Final: event.Final, Reason: "stale generation"}, nil
+	}
 	if err != nil {
 		return Prediction{}, err
 	}
@@ -147,6 +150,8 @@ func (s *Session) begin(parent context.Context) (context.Context, uint64, bool) 
 	return ctx, s.generation, true
 }
 
+var errStaleGeneration = fmt.Errorf("stale generation")
+
 func (s *Session) route(ctx context.Context, generation uint64, event Event) (Prediction, error) {
 	result, err := s.engine.Route(ctx, router.RouteRequest{Utterance: event.Transcript, Context: event.Context, Final: event.Final})
 	if err != nil {
@@ -155,7 +160,7 @@ func (s *Session) route(ctx context.Context, generation uint64, event Event) (Pr
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if generation != s.generation {
-		return Prediction{}, context.Canceled
+		return Prediction{}, errStaleGeneration
 	}
 	toolID := ""
 	if result.Decision == router.DecisionSelected && len(result.Candidates) > 0 {

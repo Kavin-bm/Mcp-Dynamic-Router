@@ -30,9 +30,6 @@ type App struct {
 
 func New(options Options) *App {
 	config := options.RouterConfig
-	if config.MaxDomainTools == 0 && config.DomainTopK == 0 && config.CandidateTopK == 0 {
-		config = router.DefaultConfig()
-	}
 	registry := router.NewRegistry()
 	routerOptions := []router.Option{}
 	if options.Reranker != nil {

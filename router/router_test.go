@@ -268,3 +268,65 @@ func TestStemmingTokenization(t *testing.T) {
 		}
 	}
 }
+
+func TestSplitIntents(t *testing.T) {
+	cases := []struct {
+		name     string
+		query    string
+		expected []string
+	}{
+		{
+			name:     "normal two-intent split",
+			query:    "check the weather and also schedule a meeting",
+			expected: []string{"check the weather", "schedule a meeting"},
+		},
+		{
+			name:     "numeric continuation is NOT split",
+			query:    "add 2 and also 3 to the list",
+			expected: []string{"add 2 and also 3 to the list"},
+		},
+		{
+			name:     "both separators numeric-guarded — no split fallback",
+			query:    "add 2 and also 3 and also 4",
+			expected: []string{"add 2 and also 3 and also 4"},
+		},
+		{
+			name:  "leading 'and also' — 'also' matches as standalone separator",
+			query: "and also buy milk and also send email",
+			// The regex treats " also " as a valid separator on its own (via the
+			// |also| branch), so "and also buy milk" is split into ["and", "buy milk"].
+			// The second " and also " then yields "send email". Result: 3 fragments.
+			expected: []string{"and", "buy milk", "send email"},
+		},
+		{
+			name:  "first match numeric-guarded, second match valid",
+			query: "add 2 and also 3 and also buy milk",
+			// first separator skipped (numeric after), second consumed
+			expected: []string{"add 2 and also 3", "buy milk"},
+		},
+		{
+			name:     "no separator — returns input unchanged",
+			query:    "get the weather forecast",
+			expected: []string{"get the weather forecast"},
+		},
+		{
+			name:     "three intents",
+			query:    "check weather then book a table and also send a recap email",
+			expected: []string{"check weather", "book a table", "send a recap email"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := splitIntents(tc.query)
+			if len(got) != len(tc.expected) {
+				t.Fatalf("len mismatch: expected %v, got %v", tc.expected, got)
+			}
+			for i := range got {
+				if got[i] != tc.expected[i] {
+					t.Errorf("fragment[%d]: expected %q, got %q", i, tc.expected[i], got[i])
+				}
+			}
+		})
+	}
+}

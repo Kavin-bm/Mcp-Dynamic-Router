@@ -64,15 +64,23 @@ func New(registry *Registry, embedder Embedder, cfg Config, options ...Option) *
 	}
 	if cfg.MinConfidence == 0 {
 		cfg.MinConfidence = defaults.MinConfidence
+	} else if cfg.MinConfidence < 0 {
+		cfg.MinConfidence = 0
 	}
 	if cfg.MinMargin == 0 {
 		cfg.MinMargin = defaults.MinMargin
+	} else if cfg.MinMargin < 0 {
+		cfg.MinMargin = 0
 	}
 	if cfg.RerankerWeight == 0 {
 		cfg.RerankerWeight = defaults.RerankerWeight
+	} else if cfg.RerankerWeight < 0 {
+		cfg.RerankerWeight = 0
 	}
 	if cfg.BM25FastPath == 0 {
 		cfg.BM25FastPath = defaults.BM25FastPath
+	} else if cfg.BM25FastPath < 0 {
+		cfg.BM25FastPath = 0
 	}
 	if cfg.RouteCacheTTL == 0 {
 		cfg.RouteCacheTTL = defaults.RouteCacheTTL
@@ -102,44 +110,67 @@ func (r *Router) Refresh(ctx context.Context) error {
 		return fmt.Errorf("cannot build router index: registry is empty")
 	}
 
-	index := &compiledIndex{version: snapshot.Version, tools: snapshot.Tools, domainTools: make(map[string][]int)}
-	domainDocuments := make(map[string][]string)
-	for toolIndex, tool := range snapshot.Tools {
-		domain := ExtractDomain(tool)
-		index.domainTools[domain] = append(index.domainTools[domain], toolIndex)
-		document := tool.Name + " " + tool.Description
-		index.toolDocuments = append(index.toolDocuments, document)
-		domainDocuments[domain] = append(domainDocuments[domain], document)
-	}
-	for domain := range domainDocuments {
-		index.domains = append(index.domains, domain)
-	}
-	sort.Strings(index.domains)
-	for _, domain := range index.domains {
-		index.domainDocs = append(index.domainDocs, domain+" "+strings.Join(domainDocuments[domain], " "))
-	}
-	index.toolLexical = newLexicalIndex(index.toolDocuments)
-	index.domainLexical = newLexicalIndex(index.domainDocs)
+	// Collapse concurrent Refresh calls for the same registry version into a
+	// single build pass. This prevents duplicate Embed calls when multiple
+	// server notifications fire simultaneously.
+	sfKey := fmt.Sprintf("refresh-v%d", snapshot.Version)
+	_, err, _ := r.sf.Do(sfKey, func() (any, error) {
+		index := &compiledIndex{version: snapshot.Version, tools: snapshot.Tools, domainTools: make(map[string][]int)}
+		domainDocuments := make(map[string][]string)
+		for toolIndex, tool := range snapshot.Tools {
+			domain := ExtractDomain(tool)
+			index.domainTools[domain] = append(index.domainTools[domain], toolIndex)
+			document := tool.Name + " " + tool.Description
+			index.toolDocuments = append(index.toolDocuments, document)
+			domainDocuments[domain] = append(domainDocuments[domain], document)
+		}
+		for domain := range domainDocuments {
+			index.domains = append(index.domains, domain)
+		}
+		sort.Strings(index.domains)
+		for _, domain := range index.domains {
+			index.domainDocs = append(index.domainDocs, domain+" "+strings.Join(domainDocuments[domain], " "))
+		}
+		index.toolLexical = newLexicalIndex(index.toolDocuments)
+		index.domainLexical = newLexicalIndex(index.domainDocs)
 
-	if r.embedder != nil {
-		toolVectors, err := r.embedBatch(ctx, index.toolDocuments)
-		if err != nil {
-			return fmt.Errorf("embed tool descriptions: %w", err)
-		}
-		domainVectors, err := r.embedBatch(ctx, index.domainDocs)
-		if err != nil {
-			return fmt.Errorf("embed domain descriptions: %w", err)
-		}
-		if len(toolVectors) != len(index.tools) || len(domainVectors) != len(index.domains) {
-			return fmt.Errorf("embedder returned an unexpected vector count")
-		}
-		index.toolVectors, index.domainVectors = toolVectors, domainVectors
-	}
+		if r.embedder != nil {
+			toolVectors, err := r.embedBatch(ctx, index.toolDocuments)
+			if err != nil {
+				return nil, fmt.Errorf("embed tool descriptions: %w", err)
+			}
+			domainVectors, err := r.embedBatch(ctx, index.domainDocs)
+			if err != nil {
+				return nil, fmt.Errorf("embed domain descriptions: %w", err)
+			}
+			if len(toolVectors) != len(index.tools) || len(domainVectors) != len(index.domains) {
+				return nil, fmt.Errorf("embedder returned an unexpected vector count")
+			}
+			index.toolVectors, index.domainVectors = toolVectors, domainVectors
 
-	r.mu.Lock()
-	r.index = index
-	r.mu.Unlock()
-	return nil
+			// Clean up stale embeddings from cache
+			validTexts := make(map[string]struct{}, len(index.toolDocuments)+len(index.domainDocs))
+			for _, text := range index.toolDocuments {
+				validTexts[text] = struct{}{}
+			}
+			for _, text := range index.domainDocs {
+				validTexts[text] = struct{}{}
+			}
+			r.cacheMu.Lock()
+			for k := range r.embedCache {
+				if _, ok := validTexts[k]; !ok {
+					delete(r.embedCache, k)
+				}
+			}
+			r.cacheMu.Unlock()
+		}
+
+		r.mu.Lock()
+		r.index = index
+		r.mu.Unlock()
+		return nil, nil
+	})
+	return err
 }
 
 func (r *Router) Route(ctx context.Context, request RouteRequest) (RouteResult, error) {
@@ -150,46 +181,50 @@ func (r *Router) Route(ctx context.Context, request RouteRequest) (RouteResult, 
 	}
 
 	fragments := splitIntents(request.Utterance)
-	var finalResult RouteResult
-	var err error
 	if len(fragments) <= 1 {
-		finalResult, err = r.routeSingle(ctx, request)
-	} else {
-		log.Printf("[Router] Multi-intent detected: %d fragments: %v", len(fragments), fragments)
-		results := make([]RouteResult, len(fragments))
-		type routeJobResult struct {
-			index  int
-			result RouteResult
-			err    error
+		result, err := r.routeSingle(ctx, request)
+		if err != nil {
+			return RouteResult{}, err
 		}
-		ch := make(chan routeJobResult, len(fragments))
-		var wg sync.WaitGroup
-		for idx, frag := range fragments {
-			wg.Add(1)
-			go func(i int, f string) {
-				defer wg.Done()
-				req := request
-				req.Utterance = f
-				res, err := r.routeSingle(ctx, req)
-				ch <- routeJobResult{index: i, result: res, err: err}
-			}(idx, frag)
+		if result.Decision != DecisionNoTool && r.cfg.RouteCacheTTL > 0 {
+			r.writeRouteCache(query, contextStr, result, r.cfg.RouteCacheTTL)
 		}
-		wg.Wait()
-		close(ch)
-
-		for job := range ch {
-			if job.err != nil {
-				return RouteResult{}, job.err
-			}
-			results[job.index] = job.result
-		}
-		finalResult = mergeRouteResults(results)
+		return result, nil
 	}
 
-	if err == nil && finalResult.Decision != DecisionNoTool && r.cfg.RouteCacheTTL > 0 {
-		r.writeRouteCache(query, contextStr, finalResult, r.cfg.RouteCacheTTL)
+	log.Printf("[Router] Multi-intent detected: %d fragments: %v", len(fragments), fragments)
+	results := make([]RouteResult, len(fragments))
+	type routeJobResult struct {
+		index  int
+		result RouteResult
+		err    error
 	}
-	return finalResult, err
+	ch := make(chan routeJobResult, len(fragments))
+	var wg sync.WaitGroup
+	for idx, frag := range fragments {
+		wg.Add(1)
+		go func(i int, f string) {
+			defer wg.Done()
+			req := request
+			req.Utterance = f
+			res, err := r.routeSingle(ctx, req)
+			ch <- routeJobResult{index: i, result: res, err: err}
+		}(idx, frag)
+	}
+	wg.Wait()
+	close(ch)
+
+	for job := range ch {
+		if job.err != nil {
+			return RouteResult{}, job.err
+		}
+		results[job.index] = job.result
+	}
+	merged := mergeRouteResults(results)
+	if merged.Decision != DecisionNoTool && r.cfg.RouteCacheTTL > 0 {
+		r.writeRouteCache(query, contextStr, merged, r.cfg.RouteCacheTTL)
+	}
+	return merged, nil
 }
 
 func (r *Router) routeSingle(ctx context.Context, request RouteRequest) (RouteResult, error) {
@@ -341,9 +376,6 @@ func (r *Router) semanticScores(ctx context.Context, query string, vectors [][]f
 // and saves the results back to the cache.
 func (r *Router) embedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	r.cacheMu.Lock()
-	if r.embedCache == nil {
-		r.embedCache = make(map[string][]float32)
-	}
 	results := make([][]float32, len(texts))
 	var misses []string
 	var missIndices []int
@@ -474,16 +506,24 @@ func splitIntents(query string) []string {
 	last := 0
 	for _, m := range matches {
 		start, end := m[0], m[1]
-		fragment := strings.TrimSpace(query[last:start])
 
+		// Guard: if the text immediately following the separator starts with a
+		// digit, treat the connector as part of the same clause (e.g. "add 3
+		// and also 5 to the list" should NOT be split). Skip this separator but
+		// still advance last so later iterations read from the correct position.
 		after := strings.TrimSpace(query[end:])
 		if len(after) > 0 && after[0] >= '0' && after[0] <= '9' {
+			// Do not commit this split point; leave last unchanged so the
+			// separator text stays attached to the current fragment.
 			continue
 		}
 
+		fragment := strings.TrimSpace(query[last:start])
+		// Always advance past this separator span regardless of whether fragment
+		// is empty (e.g. separator at the very start of the string).
+		last = end
 		if fragment != "" {
 			out = append(out, fragment)
-			last = end
 		}
 	}
 
@@ -600,7 +640,7 @@ func mergeRouteResults(results []RouteResult) RouteResult {
 func normalizeCacheKey(query, context string) string {
 	q := strings.ToLower(strings.TrimSpace(query))
 	c := strings.ToLower(strings.TrimSpace(context))
-	return q + "::" + c
+	return fmt.Sprintf("%d:%s::%d:%s", len(q), q, len(c), c)
 }
 
 func (r *Router) lookupRouteCache(query, context string) (RouteResult, bool) {
@@ -620,11 +660,20 @@ func (r *Router) writeRouteCache(query, context string, result RouteResult, ttl 
 	defer r.routeCacheMu.Unlock()
 
 	// Simple eviction if cache gets too large
-	if len(r.routeCache) > 1000 {
+	if len(r.routeCache) >= 1000 {
 		now := time.Now()
+		evicted := false
 		for k, v := range r.routeCache {
 			if now.After(v.expiresAt) {
 				delete(r.routeCache, k)
+				evicted = true
+			}
+		}
+		// If no expired entries were found, evict one pseudo-random entry to enforce cap
+		if !evicted && len(r.routeCache) >= 1000 {
+			for k := range r.routeCache {
+				delete(r.routeCache, k)
+				break
 			}
 		}
 	}

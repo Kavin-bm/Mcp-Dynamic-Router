@@ -30,6 +30,13 @@ func WithElicitationHandler(handler ElicitationHandler) Option {
 	return func(client *Client) { client.elicitationHandler = handler }
 }
 
+func WithClientInfo(name, version string) Option {
+	return func(client *Client) {
+		client.clientName = name
+		client.clientVersion = version
+	}
+}
+
 type ConnectReport struct {
 	Connected []string          `json:"connected"`
 	Failed    map[string]string `json:"failed,omitempty"`
@@ -55,19 +62,34 @@ type Client struct {
 	watcherCancel      context.CancelFunc // Cancels the background file watcher goroutine
 	watcherWait        sync.WaitGroup     // Coordinates watcher shutdown
 	onReload           func()             // Test hook called after checkConfigChanges reloads config
+	clientName         string             // Name sent in mcp.ClientOptions
+	clientVersion      string             // Version sent in mcp.ClientOptions
 }
 
 func New(registry *router.Registry, onToolsChanged func(context.Context) error, options ...Option) *Client {
-	client := &Client{registry: registry, onToolsChanged: onToolsChanged, sessions: make(map[string]*session)}
+	client := &Client{registry: registry, onToolsChanged: onToolsChanged, sessions: make(map[string]*session), clientName: "mcp-dynamic-router", clientVersion: "0.1.0"}
 	for _, option := range options {
 		option(client)
 	}
 	return client
 }
 
-// ConnectFile loads mcp.toml and connects every configured server. Individual
-// server failures are returned in the report so healthy servers remain usable.
+// ConnectFile loads mcp.toml, connects every configured server, and starts the
+// background config-file watcher. Individual server failures are returned in the
+// report so healthy servers remain usable. The watcher is always started so that
+// a corrected config is picked up automatically even if the initial connect fails.
 func (c *Client) ConnectFile(ctx context.Context, configPath string) (ConnectReport, error) {
+	report, err := c.connectServers(ctx, configPath)
+	c.startWatcher(configPath)
+	return report, err
+}
+
+
+// connectServers loads the config file, dials every server, and calls
+// onToolsChanged. It intentionally does NOT start or restart the watcher —
+// callers that are already inside the watcher goroutine must use this method
+// to avoid spawning a second concurrent watcher.
+func (c *Client) connectServers(ctx context.Context, configPath string) (ConnectReport, error) {
 	config, err := LoadConfig(configPath)
 	if err != nil {
 		return ConnectReport{}, err
@@ -97,7 +119,6 @@ func (c *Client) ConnectFile(ctx context.Context, configPath string) (ConnectRep
 		}
 	}
 	sort.Strings(report.Connected)
-	c.startWatcher(configPath)
 	if len(report.Connected) == 0 {
 		return report, fmt.Errorf("could not connect any configured MCP server")
 	}
@@ -120,7 +141,7 @@ func (c *Client) Connect(ctx context.Context, server Server) error {
 		return fmt.Errorf("server %q uses unsupported transport %q; use streamable-http", server.Name, server.Transport)
 	}
 	holder := &session{server: server}
-	client := mcp.NewClient(&mcp.Implementation{Name: "mcp-dynamic-router", Version: "0.1.0"}, &mcp.ClientOptions{
+	client := mcp.NewClient(&mcp.Implementation{Name: c.clientName, Version: c.clientVersion}, &mcp.ClientOptions{
 		KeepAlive:          30 * time.Second,
 		ElicitationHandler: c.resolveElicitation(server.Name),
 		ToolListChangedHandler: func(_ context.Context, _ *mcp.ToolListChangedRequest) {
@@ -291,7 +312,9 @@ func (c *Client) checkConfigChanges(ctx context.Context) {
 
 	log.Printf("[MCP Watcher] Config file %s modified; performing full hot-reload...", path)
 	_ = c.closeSessions()
-	_, reloadErr := c.ConnectFile(ctx, path)
+	// Use connectServers instead of ConnectFile to avoid spawning a second watcher
+	// goroutine from inside the existing one. This goroutine IS the watcher.
+	_, reloadErr := c.connectServers(ctx, path)
 	if reloadErr != nil {
 		log.Printf("[MCP Watcher] Reload failed for config %s: %v", path, reloadErr)
 	} else {
@@ -319,10 +342,13 @@ func (c *Client) get(serverName string) (*session, error) {
 func (c *Client) refreshAfterNotification(serverName string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if c.SyncServer(ctx, serverName) != nil {
+	if err := c.SyncServer(ctx, serverName); err != nil {
+		log.Printf("[MCP Client] Failed to sync server %q after tool list change: %v", serverName, err)
 		return
 	}
 	if c.onToolsChanged != nil {
-		_ = c.onToolsChanged(ctx)
+		if err := c.onToolsChanged(ctx); err != nil {
+			log.Printf("[MCP Client] Failed to update tools after notification for %q: %v", serverName, err)
+		}
 	}
 }

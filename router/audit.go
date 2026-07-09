@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 )
 
 type DescriptionPolicy struct {
@@ -36,6 +37,17 @@ type AuditReport struct {
 
 var headingPattern = regexp.MustCompile(`(?im)^\s*(domain|purpose|invoke when|parameters|limitations|example)\s*:\s*`)
 
+var sectionRegexCache sync.Map
+
+func getSectionRegex(section string) *regexp.Regexp {
+	if cached, ok := sectionRegexCache.Load(section); ok {
+		return cached.(*regexp.Regexp)
+	}
+	re := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(section) + `\s*:`)
+	sectionRegexCache.Store(section, re)
+	return re
+}
+
 func AuditTool(tool Tool, policy DescriptionPolicy) AuditReport {
 	report := AuditReport{ToolID: tool.ID, Score: 100}
 	description := strings.TrimSpace(tool.Description)
@@ -45,11 +57,11 @@ func AuditTool(tool Tool, policy DescriptionPolicy) AuditReport {
 		report.add("warning", "description.too_short", fmt.Sprintf("description should be at least %d characters", policy.MinimumDescription), 10)
 	}
 	for _, section := range policy.RequiredSections {
-		if !regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(section) + `\s*:`).MatchString(lower) {
+		if !getSectionRegex(section).MatchString(lower) {
 			report.add("error", "section.missing."+strings.ReplaceAll(section, " ", "_"), "missing required section: "+section, 12)
 		}
 	}
-	if policy.RequireDomain && strings.TrimSpace(tool.Domain) == "" && !regexp.MustCompile(`(?m)^\s*domain\s*:`).MatchString(lower) {
+	if policy.RequireDomain && strings.TrimSpace(tool.Domain) == "" && !getSectionRegex("domain").MatchString(lower) {
 		report.add("error", "domain.missing", "set Tool.Domain or add a Domain: section", 12)
 	}
 

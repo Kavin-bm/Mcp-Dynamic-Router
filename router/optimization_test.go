@@ -136,3 +136,49 @@ func TestSingleflightCollapsing(t *testing.T) {
 	}
 	fmt.Printf("Singleflight calls collapsed to: %d/%d\n", calls, concurrency)
 }
+
+func TestConcurrentRefreshCollapsesDuplicateEmbedCalls(t *testing.T) {
+	embedder := &mockEmbedder{vectorSize: 4}
+	registry := NewRegistry()
+	router := New(registry, embedder, DefaultConfig())
+
+	tool := Tool{
+		ID: "weather.get", Name: "get_weather", Server: "weather",
+		Domain: "weather", Description: "Get weather forecast for a city",
+		InputSchema: json.RawMessage(`{}`),
+	}
+	if err := registry.ReplaceServer("weather", []Tool{tool}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fire N concurrent Refresh calls against the same registry version.
+	// The singleflight key is "refresh-v<version>", so all calls for the
+	// same version must collapse to a single embedder invocation.
+	const concurrency = 10
+	var wg sync.WaitGroup
+	errs := make(chan error, concurrency)
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := router.Refresh(context.Background()); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	calls := atomic.LoadInt64(&embedder.calls)
+	// With singleflight on the registry version, at most 1 call should reach
+	// the embedder (all 10 goroutines share the same version key).
+	// Allow 2 as a tolerance for scheduler timing.
+	if calls > 2 {
+		t.Errorf("expected concurrent Refresh to collapse embed calls via singleflight, got %d embed calls for %d goroutines", calls, concurrency)
+	}
+	t.Logf("embed calls collapsed from %d goroutines to %d embedder call(s)", concurrency, calls)
+}
+
