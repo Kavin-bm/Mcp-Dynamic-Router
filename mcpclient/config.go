@@ -44,15 +44,25 @@ func LoadConfig(configPath string) (FileConfig, error) {
 		server := &config.Servers[index]
 		server.Name = strings.TrimSpace(server.Name)
 		server.URL = strings.TrimSpace(server.URL)
+		server.Command = strings.TrimSpace(server.Command)
 		server.Transport = strings.TrimSpace(strings.ToLower(server.Transport))
 		if server.Transport == "" {
 			server.Transport = "streamable-http"
 		}
-		if server.Name == "" || server.URL == "" {
-			return FileConfig{}, fmt.Errorf("server %d requires name and url", index+1)
+		if server.Name == "" {
+			return FileConfig{}, fmt.Errorf("server %d requires name", index+1)
 		}
-		if server.Transport != "streamable-http" && server.Transport != "http" {
-			return FileConfig{}, fmt.Errorf("server %q uses unsupported transport %q; use streamable-http", server.Name, server.Transport)
+		switch server.Transport {
+		case "streamable-http", "http":
+			if server.URL == "" {
+				return FileConfig{}, fmt.Errorf("server %q (%s) requires url", server.Name, server.Transport)
+			}
+		case "stdio":
+			if server.Command == "" {
+				return FileConfig{}, fmt.Errorf("server %q (stdio) requires command", server.Name)
+			}
+		default:
+			return FileConfig{}, fmt.Errorf("server %q uses unsupported transport %q; use streamable-http or stdio", server.Name, server.Transport)
 		}
 		if _, duplicate := seen[server.Name]; duplicate {
 			return FileConfig{}, fmt.Errorf("duplicate server name %q", server.Name)

@@ -11,95 +11,139 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/kavinbm16/Mcp-Dynamic-Router.svg" alt="License"></a>
 </p>
 
-<h3 align="center">Give your voice pipeline thousands of tools. Let the model see only the right few.</h3>
+<h3 align="center">Give your LLM and voice pipelines access to hundreds of MCP tools — while exposing only the right 1–3 candidates on every turn.</h3>
 
 ---
 
-## ❓ Why MCP Dynamic Router?
+## 💡 Why Dynamic Routing?
 
-If you hardcode 10+ downstream MCP servers in your `claude_config.json`:
-* **Huge Context Window Overhead:** You force the LLM to process schemas and parameter definitions for all 100+ tools on every turn, driving up latency and token costs.
-* **Accuracy Degradation:** Registering too many tools introduces semantic confusion, causing the LLM to hallucinate arguments or pick the wrong tool.
-* **Static Lifecycle:** Adding or removing a tool requires restarting the LLM session.
+Hardcoding dozens of MCP servers into your agent or LLM client creates severe bottlenecks:
 
-**MCP Dynamic Router** acts as an intelligent middleware layer:
-1. **Centralized Lifecycle:** Concurrently connects and orchestrates multiple MCP servers (SSE/HTTP), dynamically hot-reloading tool schemas in real-time.
-2. **Sub-1ms Latency (Fast-Path):** Exact lexical matches bypass semantic vector embeddings and LLM reranking calls entirely, returning in `<1ms`.
-3. **Stream RAG Prefetching:** Evaluates partial speech transcripts *while the user is still speaking* to warm connections and prefetch read-only tools safely.
-4. **Security & Custom Scoping:** Restricts tool exposure on a per-request basis and safely abstains from execution when query confidence is low.
+| Problem | Naive Setup (All Tools in LLM Context) | With MCP Dynamic Router |
+|---|---|---|
+| **Context Overhead** | 50–100+ tool schemas passed on every turn, burning tokens. | Only **1–3 candidate schemas** exposed per turn. |
+| **Model Confusion** | High hallucination rate and misrouted tool calls. | Hybrid BM25 + Vector ranking isolates the exact tool. |
+| **Voice Latency** | Waits for speech to finish before starting tool retrieval. | **Stream RAG** routes partial transcripts while user is speaking. |
+| **Lifecycle** | Adding a tool requires restarting the LLM session. | **Zero-downtime hot-reload** via config watcher & MCP notifications. |
+| **Safety** | LLM can invoke wrong tools on ambiguous input. | **Safe Abstention Policy** (`clarify` / `no_tool`). |
 
 ```mermaid
 graph TD
-    User([User Prompt / Speech]) -->|1. Audio / Text| Client[Client Agent / App]
+    User([User Prompt / Speech]) -->|1. Utterance or Partials| Agent[Voice Pipeline / Agent App]
     
     subgraph Gateway ["MCP Dynamic Router Gateway (routerd)"]
-        Client -->|2. Route / Stream| API[HTTP endpoints: /v1/route, /v1/stream]
-        API -->|3. Select Candidates| Routing[Two-Stage Routing Engine]
-        Client -->|4. Execute Tool| API
-        API -->|5. Validate Schema| Validator{JSON Schema Validator}
-        API -->|6. Dispatch Call| Downstream[SSE / HTTP MCP Clients]
+        Agent -->|2. Route / Stream| API[HTTP Endpoints: /v1/route, /v1/stream]
+        API -->|3. Two-Stage Search| Engine[BM25 Fast-Path & Hybrid Routing]
+        Engine -->|4. Selected Tool| API
+        Agent -->|5. Execute Tool| API
+        API -->|6. Validate Schema| Validator{JSON Schema Validator}
+        API -->|7. Proxy Call| Downstream[MCP Transports: HTTP/SSE & Stdio]
     end
     
-    subgraph Servers ["Downstream Servers"]
-        Downstream -->|7. JSON-RPC| S1[Weather Server]
-        Downstream -->|7. JSON-RPC| S2[Wellness Server]
+    subgraph Servers ["Downstream MCP Servers"]
+        Downstream -->|Streamable HTTP| S1[Weather Service]
+        Downstream -->|Local Stdio CLI| S2[Database / Filesystem Service]
     end
 ```
 
 ---
 
-## ⚡ Key Capabilities
+## ⚡ 60-Second Quickstart
 
-* **🔌 Dynamic Server Orchestration** — Concurrently connects to multiple MCP servers via HTTP/SSE, handling live hot-reloads when tool schemas are updated.
-* **📈 Stream RAG Engine** — Starts routing partial transcripts *while the user is still speaking* to warm downstream connections and prefetch read-only tools safely.
-* **🎯 Hybrid Scoring & Reranking** — Blends BM25 lexical scoring, semantic vector embeddings, and LLM-based reranking for precise, low-latency selection.
-* **🛡️ Secure Abstention Policy** — Abstains from routing when inputs are ambiguous or below confidence thresholds to prevent errant mutations.
-* **🚀 Multi-Language Compatibility** — Embed directly in your Go codebase or deploy as a lightweight local HTTP sidecar companion to Python, TypeScript, LiveKit, or Pipecat agents.
+Try the router locally with zero setup using the included mock servers.
+
+### 1. Start the Mock Servers
+```bash
+go run ./cmd/mock-servers
+```
+*(Starts mock weather on `:8091` and mock calculator on `:8092`, generating `mcp-mock.toml`)*
+
+### 2. Start the Dynamic Router Daemon
+In a second terminal:
+```bash
+go run ./cmd/routerd -mcp mcp-mock.toml
+```
+*(Boots the sidecar gateway on `http://127.0.0.1:8090`)*
+
+### 3. Route & Execute
+In a third terminal, route a question:
+```bash
+curl -s -X POST http://localhost:8090/v1/route \
+  -H "Content-Type: application/json" \
+  -d '{"utterance": "What is the weather in New York?", "final": true}'
+```
+Response selects `weather.forecast` in `<1ms`:
+```json
+{
+  "decision": "selected",
+  "confidence": 1.0,
+  "candidates": [
+    { "tool": { "id": "weather.forecast", "name": "forecast" }, "score": 1.0, "rank": 1 }
+  ]
+}
+```
+
+Now execute the selected tool via the gateway (arguments are validated against the tool's schema):
+```bash
+curl -s -X POST http://localhost:8090/v1/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tool_id": "weather.forecast",
+    "arguments": { "location": "New York" }
+  }'
+```
+
+---
+
+## 🎯 Core Concepts
+
+### 1. Two-Stage Routing Pipeline
+To scale to thousands of tools without latency hits, routing occurs in two stages:
+- **Fast-Path (<1ms)**: If lexical BM25 confidence exceeds `BM25FastPath` (default `8.0`), vector embeddings and LLM rerankers are bypassed entirely.
+- **Stage 1 (Domain Filtering)**: Tools are grouped into domain clusters (`weather`, `calendar`, `database`). BM25 + embeddings pick the top domains, capping candidates to a maximum of 20 tools.
+- **Stage 2 (Tool Shortlist & Fusion)**: Lexical and semantic scores are normalized and fused. An optional local LLM reranker can be applied.
+
+### 2. Stream RAG (For Voice Pipelines)
+Normal pipelines wait until the user stops speaking before starting tool selection. **Stream RAG** evaluates intermediate speech-to-text partials *while the user is still speaking*:
 
 ```text
 "Could you check the weather in Bengaluru tom—"
                          │
-                         ├── partial transcript → domain retrieval → tool shortlist
-                         │                                      └── warm safe context
+                         ├── partial ASR update → domain retrieval → shortlist
+                         │                                      └── warm safe connection
                          │
-"...tomorrow morning?" ─┴── final transcript → confirm route → bind → execute
+"...tomorrow morning?" ──┴── final commit → confirm route → bind args → execute
 ```
+- **Hysteresis Stability**: Requires consecutive identical winner tools before marking route `stable`.
+- **Read-Only Prefetching**: Safe tools marked `read_only: true` can be prefetched to warm downstream caches. Mutating actions are **never** executed speculatively.
 
-The router is completely **provider-neutral**; it integrates seamlessly with any STT, LLM, TTS, realtime voice API, or agent framework.
-
-> **Status:** Active development. Dynamic registry discovery, automated tool auditing, hybrid retrieval, Stream RAG, schema validation, and HTTP sidecar are fully implemented and tested.
-
-
-## 🚀 30-Second Quickstart
-
-Try out the dynamic router locally with zero configuration. We provide a mock server command that hosts two dummy MCP services (weather and calculator) and auto-generates `mcp-mock.toml` for you.
-
-### 1. Spin up the Mock MCP Servers
-Open a terminal and run:
-```bash
-go run ./cmd/mock-servers
-```
-*(This starts a Mock Weather Service on `:8091` and a Mock Calculator Service on `:8092`, writing a local `mcp-mock.toml` file.)*
-
-### 2. Start the Dynamic Router Daemon
-Open a second terminal and run:
-```bash
-go run ./cmd/routerd -mcp mcp-mock.toml
-```
-*(This boots the dynamic gateway sidecar on `:8090` and connects to both downstream mock servers.)*
-
-### 3. Verify Routing
-Open a third terminal and test routing with a simple HTTP request:
-```bash
-curl -s -X POST http://localhost:8090/v1/route \
-  -H "Content-Type: application/json" \
-  -d '{"utterance": "What is the weather in New York?"}'
-```
-You will receive a JSON response showing the weather service selected, completely bypassing the calculator service!
+### 3. Safe Abstention Policy
+Wrong actions are worse than delayed actions. The router makes one of three decisions:
+- **`selected`**: Top tool passed both confidence threshold (`MinConfidence: 0.42`) and safety margin (`MinMargin: 0.06`).
+- **`clarify`**: Two or more plausible tools scored too close together to choose safely.
+- **`no_tool`**: Input is general chit-chat or confidence is below threshold.
 
 ---
 
-### 2A. Drop it into Go
+## 🛠️ How to Integrate
+
+You can use the Dynamic Router in two ways:
+
+### Option A: Run as a Sidecar (`routerd`)
+Ideal for **Python, TypeScript, Node.js, LiveKit, Pipecat, OpenAI Realtime, and Gemini Live** agents.
+
+Run the sidecar:
+```bash
+go run ./cmd/routerd -mcp mcp.toml
+```
+
+From any language, interact via simple HTTP JSON requests:
+- `POST /v1/route` — Stateless routing for a single user turn.
+- `POST /v1/stream` — Incremental streaming ASR updates with session tracking.
+- `POST /v1/execute` — Execute the tool with schema validation.
+
+### Option B: Embed Directly in Go
+Import the package directly into your Go binary:
 
 ```go
 package main
@@ -107,501 +151,144 @@ package main
 import (
     "context"
     "fmt"
-
     dynamicrouter "github.com/kavinbm16/mcp-dynamic-router"
     "github.com/kavinbm16/mcp-dynamic-router/router"
 )
 
 func main() {
     ctx := context.Background()
-    app := dynamicrouter.NewBuilder().WithMCPConfigPath("mcp.toml").Build()
+    
+    // Fluent Builder initialization
+    app := dynamicrouter.NewBuilder().
+        WithMCPConfigPath("mcp.toml").
+        Build()
     defer app.Close()
 
-    report, err := app.Start(ctx)
-    if err != nil { panic(err) }
-    fmt.Println("connected:", report.Connected)
+    if _, err := app.Start(ctx); err != nil {
+        panic(err)
+    }
 
     result, err := app.Route(ctx, router.RouteRequest{
-        Utterance: "Will I need an umbrella in Bengaluru tomorrow?",
-        Context:   "User timezone: Asia/Kolkata",
+        Utterance: "What is the weather in Bengaluru?",
         Final:     true,
     })
-    if err != nil { panic(err) }
+    if err != nil {
+        panic(err)
+    }
 
-    fmt.Println(result.Decision, result.Candidates[0].Tool.ID)
+    fmt.Printf("Decision: %s, Tool: %s\n", result.Decision, result.Candidates[0].Tool.ID)
 }
 ```
 
-### 2B. Or run the sidecar beside any pipeline
+---
 
-```bash
-go run ./cmd/routerd -mcp mcp.toml
+## ⚙️ Configuration (`mcp.toml`)
+
+Configure both remote HTTP/SSE servers and local CLI tools (`stdio`):
+
+```toml
+[elicitation]
+enabled = false
+auto_accept = false
+timeout = 30
+
+# 1. Streamable HTTP / SSE MCP Server
+[[servers]]
+name = "weather-service"
+transport = "streamable-http"
+url = "http://localhost:8091/mcp"
+
+# 2. Local CLI MCP Server (stdio sub-process)
+[[servers]]
+name = "local-fetch"
+transport = "stdio"
+command = "uvx"
+args = ["mcp-server-fetch"]
 ```
 
-Route a final utterance:
+> **Zero-Downtime Hot-Reload:** `routerd` watches `mcp.toml`. Modifying the file automatically updates server connections. If a syntax error is introduced, the reload is safely aborted and existing working sessions are preserved.
 
-```bash
-curl -s http://127.0.0.1:8090/v1/route \
-  -H 'content-type: application/json' \
-  -d '{
-    "utterance": "Will I need an umbrella in Bengaluru tomorrow?",
-    "context": "User timezone: Asia/Kolkata",
-    "final": true
-  }'
-```
+---
 
-Then execute the selected tool (the sidecar proxies the call to the downstream MCP server and automatically validates arguments against the tool's JSON schema):
+## 📡 HTTP API Reference
 
-```bash
-curl -s http://127.0.0.1:8090/v1/execute \
-  -H 'content-type: application/json' \
-  -d '{
-    "tool_id": "weather-service.get_forecast",
-    "arguments": {
-      "location": "Bengaluru",
-      "units": "metric"
-    }
-  }'
-```
+`routerd` listens on `127.0.0.1:8090` by default and includes CORS support.
 
-That is the complete integration boundary: JSON in, routing decision and tool execution output out. The client does not need any MCP-specific connection code.
+| Endpoint | Method | Purpose | Key Parameters |
+|---|---|---|---|
+| `/healthz` | `GET` | Liveness & Readiness probe | Returns server count and tool count |
+| `/v1/route` | `POST` | Route a single utterance | `{"utterance": "...", "context": "...", "final": true}` |
+| `/v1/stream` | `POST` | Stream RAG partial updates | `{"session_id": "...", "transcript": "...", "confidence": 0.9, "final": false}` |
+| `/v1/execute` | `POST` | Validate & execute tool | `{"tool_id": "...", "arguments": {...}}` |
+| `/v1/tools` | `GET` | List all loaded tools | Returns full registry snapshot |
+| `/v1/servers` | `GET` | List connected servers | Returns active server IDs |
+| `/metrics` | `GET` | Prometheus metrics | Request counts, decision distributions, latencies |
 
-## Stream RAG: route before the user stops speaking
+---
 
-Normal tool routing waits for end-of-turn. Stream RAG spends that otherwise idle speech time retrieving the likely domain and tool.
+## 📚 Integration Blueprints & Examples
 
-The included Stream RAG session does four precise things:
+Full, runnable integrations are available in the [`examples/`](examples) directory:
 
-1. Ignores partials that are too short or have weak ASR confidence.
-2. Cancels routing for an older partial when a newer hypothesis arrives.
-3. Marks a route stable only after the same tool wins consecutive updates.
-4. Allows prefetch only for tools marked `readOnly`; final transcripts alone trigger commit.
+- **[Gemini Multimodal Live API (Python)](examples/gemini/gemini_live.py)** — Voice loop routing tool calls through the sidecar.
+- **[LiveKit Agents (Python)](examples/livekit/livekit_agent.py)** — Streaming ASR partials and speech commit handling.
+- **[Pipecat (Python)](examples/pipecat/pipecat_router.py)** — Real-time prefetching pipeline with Pipecat voice bots.
+- **[OpenAI Realtime API (Python)](examples/openai_realtime/openai_realtime_session.py)** — WebSockets session intercepting tool intents.
+- **[Google GenAI SDK (Go)](examples/gemini_go/main.go)** — Official Gemini function calling in Go.
+- **[Custom Embedder & Reranker (Go)](examples/go_custom_llm/main.go)** — Hooking in custom OpenAI, Cohere, or HuggingFace models.
+- **[Standalone Go HTTP Gateway (Go)](examples/go_http_server/main.go)** — Custom server wrapping the dynamic router library.
 
-It never treats a partial transcript as permission to perform a side effect.
+---
 
-### From any language over HTTP
+<details>
+<summary><b>🔍 Advanced Features & Quality Standards (Click to Expand)</b></summary>
 
-Send partial ASR updates as they arrive:
+### 1. Zero-Allocation Inverted Index
+BM25 retrieval uses an inverted posting index (`router/bm25.go`) with sub-2µs scoring and 99% allocation reduction, delivering consistent `<10µs` end-to-end lexical routing.
 
-```bash
-curl -s http://127.0.0.1:8090/v1/stream \
-  -H 'content-type: application/json' \
-  -d '{
-    "session_id": "call-42",
-    "transcript": "check the weather in Bengaluru",
-    "confidence": 0.91,
-    "final": false
-  }'
-```
+### 2. Persistent Embedding Cache
+Configure `WithEmbeddingCachePath("cache/embeddings.json")` to persist vector embeddings to disk across daemon restarts, eliminating duplicate embedding calls.
 
-Then commit the final transcript with the same session ID:
+### 3. Fail-Open Outage Resilience
+If your remote embedding or reranking service (Ollama / Cloud LLM) fails or times out, the router automatically degrades to pure BM25 lexical routing without returning 500 errors.
 
-```bash
-curl -s http://127.0.0.1:8090/v1/stream \
-  -H 'content-type: application/json' \
-  -d '{
-    "session_id": "call-42",
-    "transcript": "check the weather in Bengaluru tomorrow morning",
-    "confidence": 0.97,
-    "final": true
-  }'
-```
-
-Each response contains `triggered`, `stable`, `stability_count`, the routing decision, candidates, confidence, margin, and phase latencies. Final requests automatically close their server-side Stream RAG session; abandoned sessions expire after two minutes.
-
-### Directly inside Go
-
-```go
-session := app.NewStreamBuilder().
-    OnPrediction(func(p streamrag.Prediction) {
-        log.Printf("partial route stable=%v decision=%s", p.Stable, p.Result.Decision)
-    }).
-    OnPrefetch(func(ctx context.Context, tool router.Tool) error {
-        // Warm a cache or downstream connection. Never execute a mutation here.
-        return warm(tool)
-    }).
-    OnCommit(func(p streamrag.Prediction) {
-        // The transcript is final. Continue to argument binding and policy.
-        commit(p.Result)
-    }).
-    Build()
-defer session.Close()
-
-session.Submit(ctx, streamrag.Event{
-    Transcript: partialTranscript,
-    Confidence: asrConfidence,
-    Final:      false,
-})
-```
-
-`Submit` is asynchronous and returns immediately. `Update` offers the same state machine synchronously for request/response transports.
-
-## Where it fits
-
-| Pipeline | Integration point |
-|---|---|
-| Cascaded STT → LLM → TTS | Send every useful STT partial to `/v1/stream`; send the end-of-turn transcript with `final:true`. |
-| Native speech-to-speech API | Mirror transcript events into Stream RAG; return the final selected schema to the realtime model. |
-| Text agent | Call `/v1/route` once per final user message. |
-| Go agent | Embed the root `dynamicrouter.App`. |
-| Python or TypeScript agent | Run `routerd` as a local sidecar and use ordinary HTTP JSON. |
-| Multi-agent system | Run one shared router service or one registry-isolated instance per trust boundary. |
-
-The pipeline owns audio and conversation UX. The router owns discovery, narrowing, ranking, uncertainty, and MCP connections.
-
-## Accuracy begins in the tool description
-
-A router cannot infer a limitation that the tool never states. A 2026 analysis of 856 MCP tools reported that **97.1% contained at least one description defect**. See the [MCP tool-description quality study](https://arxiv.org/abs/2602.14878).
-
-Use this format in the ordinary MCP `description` field:
-
-```text
-Domain: calendar
-
-Purpose: Create a new event in the user's calendar.
-
-Invoke when: Call this tool when the user explicitly asks to schedule,
-book, or add a calendar event.
-
-Parameters:
-- title (string, required): Short event title. Spoken example: "dentist appointment".
-- start_time (string, required): ISO-8601 time resolved in the user's timezone.
-  Spoken example: "tomorrow at three".
-- timezone (string, optional): IANA timezone such as "Asia/Kolkata".
-
-Limitations:
-- Does not search, update, or delete existing events.
-- Must not be called when the user is only asking about availability.
-- Requires confirmation before inviting external attendees.
-
-Example:
-User: "Schedule lunch with Mira tomorrow at noon."
-Arguments: {"title":"Lunch with Mira","start_time":"2026-06-30T12:00:00+05:30","timezone":"Asia/Kolkata"}
-```
-
-Why these fields matter:
-
-| Field | What it gives the router |
-|---|---|
-| `Domain` | A small first-stage search space. |
-| `Purpose` | Positive semantic identity. |
-| `Invoke when` | Natural utterance patterns and intent boundaries. |
-| `Parameters` | Spoken-to-schema grounding. |
-| `Limitations` | Negative evidence against confusing neighbors. |
-| `Example` | A realistic bridge from speech to valid arguments. |
-
-`Domain` is a router convention rather than an MCP requirement. Set `Tool.Domain` directly, include `Domain:` in the description, or let the router fall back to the MCP server name.
-
-The JSON Schema should repeat every machine-enforceable fact:
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "title": {
-      "type": "string",
-      "description": "Short event title inferred from the user's words"
-    },
-    "timezone": {
-      "type": "string",
-      "description": "IANA timezone",
-      "examples": ["Asia/Kolkata"]
-    }
-  },
-  "required": ["title"],
-  "additionalProperties": false
-}
-```
-
-Audit descriptions locally or in CI:
-
+### 4. Tool Description Auditing (`router-audit`)
+High-precision routing requires descriptive tool definitions. Audit descriptions locally or in CI:
 ```bash
 go run ./cmd/router-audit -tools testdata/tools.json -minimum 90
 ```
-
-The command exits non-zero when a description fails the policy.
-
-## How routing works
-
-```mermaid
-flowchart LR
-    A["Utterance + conversation context"] --> B["Stage 1: domain router"]
-    R["Dynamic MCP registry"] --> C["Tool-card compiler"]
-    C --> B
-    B -->|"20 tools maximum"| D["Stage 2: tool selector"]
-    D --> E["Confidence + margin policy"]
-    E --> F["selected"]
-    E --> G["clarify"]
-    E --> H["no_tool"]
-    F --> I["Schema validation"]
-    I --> J["MCP execution"]
+Recommended format for tool descriptions:
+```text
+Domain: calendar
+Purpose: Create a new event in the user's calendar.
+Invoke when: Call this tool when the user asks to schedule or add an event.
+Parameters: title (string), start_time (ISO-8601).
+Limitations: Does not search or delete existing events.
+Example: User: "Schedule lunch tomorrow at noon."
 ```
 
-### Stage 1: domain router
-
-The registry is grouped into explicit domain documents. BM25 and optional embedding retrieval choose the relevant domain buckets, then cap the active pool at 20 tools. Large domains are internally ranked before truncation; tool order never decides the shortlist.
-
-### Stage 2: tool selector
-
-Choose the cost/accuracy point your pipeline needs:
-
-- **Lexical:** dependency-free BM25.
-- **Hybrid:** BM25 and embedding similarity fused together.
-- **Reranked:** hybrid retrieval plus a small constrained-output LLM over the shortlist.
-
-#### Score Fusion Formula
-
-When using hybrid routing, lexical and semantic scores are normalized and fused using your configured weights:
-
-1. **Normalize Scores**: For both lexical and semantic runs, individual scores are normalized by the maximum score in that set:
-   $$S_{norm} = \frac{S}{S_{max}}$$
-2. **Weight Fusing**: Normalized weights are computed as:
-   $$W_{lex\_norm} = \frac{W_{lex}}{W_{lex} + W_{sem}}, \quad W_{sem\_norm} = \frac{W_{sem}}{W_{lex} + W_{sem}}$$
-   $$S_{fused} = W_{lex\_norm} \cdot S_{lex\_norm} + W_{sem\_norm} \cdot S_{sem\_norm}$$
-3. **Reranker Interpolation**: If a stage-two reranker is enabled, the final score interpolates the fused score and the reranker score ($S_{rerank} \in [0, 1]$):
-   $$S_{final} = (1 - W_{reranker}) \cdot S_{fused} + W_{reranker} \cdot S_{rerank}$$
-
-### Abstention
-
-The router returns:
-
-- `selected` when confidence and top-1 margin both pass;
-- `clarify` when plausible tools are too close;
-- `no_tool` when no candidate is strong enough.
-
-Wrong actions are not a latency optimization. Confidence thresholds must be calibrated on your held-out data.
-
-#### Calibrating the Decision Policy
-
-The policy uses two hyperparameters from your config to control routing behavior:
-
-| Parameter | Type | Default | Tuning Strategy |
-|---|---|---|---|
-| `MinConfidence` | float | `0.42` | **Raise** to reduce false-positive routings (e.g., routing random chat to tools). **Lower** if valid intents are getting classified as `no_tool`. |
-| `MinMargin` | float | `0.06` | **Raise** to enforce strict disambiguation (yields `clarify` if tools are close). **Lower** if similar tools are safe to execute interchangeably. |
-
-## Optional local intelligence
-
-Enable Ollama embeddings and a stage-two selector in the sidecar:
-
-```bash
-go run ./cmd/routerd \
-  -mcp mcp.toml \
-  -ollama http://localhost:11434 \
-  -embedding-model nomic-embed-text \
-  -selector-model qwen3:4b
-```
-
-Or configure them in Go:
-
-```go
-app := dynamicrouter.NewBuilder().
-    WithMCPConfigPath("mcp.toml").
-    WithEmbedder(&embedding.Ollama{
-        BaseURL: "http://localhost:11434",
-        Model:   "nomic-embed-text",
-    }).
-    WithReranker(&selector.Ollama{
-        BaseURL: "http://localhost:11434",
-        Model:   "qwen3:4b",
-    }).
-    Build()
-```
-
-Both interfaces are replaceable. Implement `router.Embedder` or `router.Reranker` to use another local model, hosted API, or specialized classifier.
-
-## Dynamic MCP behavior
-
-- Servers connect concurrently from `mcp.toml`.
-- One failed server does not disable healthy servers.
-- Connections use reusable Streamable HTTP sessions.
-- `notifications/tools/list_changed` atomically replaces that server's tools and rebuilds the index.
-- In-flight requests continue against their immutable snapshot.
-- Tool arguments can be checked with `router.ValidateArguments` before execution.
-
-### Elicitation
-
-- `enabled=false`: no elicitation handler is advertised.
-- `enabled=true, auto_accept=false`: requests are declined unless the application supplies `mcpclient.WithElicitationHandler`.
-- `auto_accept=true`: requests are accepted automatically. Avoid this for consequential tools.
-- `timeout`: application-handler deadline in seconds.
-
-Voice applications should map elicitation into their own user-confirmation state machine. Silence is not consent.
-
-## Measure it
-
-The included evaluator reads a tool registry and labelled JSONL:
-
-```json
-{"utterance":"Will I need an umbrella in Bengaluru?","expected_tool":"weather.get_forecast"}
-{"utterance":"Tell me a bedtime story","expected_tool":""}
-```
-
-Run the lexical baseline:
-
+### 5. Accuracy & Latency Benchmark (`router-eval`)
+Evaluate top-1/top-5 accuracy and routing latency against labeled cases:
 ```bash
 go run ./cmd/router-eval -tools testdata/tools.json -cases testdata/cases.jsonl
 ```
+</details>
 
-Run hybrid retrieval:
+---
 
-```bash
-go run ./cmd/router-eval \
-  -tools testdata/tools.json \
-  -cases testdata/cases.jsonl \
-  -ollama http://localhost:11434 \
-  -model nomic-embed-text
-```
+## 🐳 Docker Deployment
 
-The report includes top-1 accuracy, top-5 recall, false routing on no-tool requests, and P50/P95 routing latency.
+Run the sidecar with Docker:
 
-A credible dataset includes confusing tool pairs, real ASR errors, no-tool requests, spoken names and numbers, cross-turn context, and registries at multiple scales. Tune on development data; publish results on a held-out test set.
-
-## HTTP API
-
-`routerd` binds to `127.0.0.1:8090` by default. Set `-listen` deliberately when exposing it beyond the local machine; authentication and TLS belong at the deployment boundary.
-
-### Endpoints
-
-#### `GET /healthz`
-Returns `200 OK` if the process is up and healthy.
-**Response**:
-```json
-{
-  "status": "ok"
-}
-```
-
-#### `POST /v1/route`
-Routes a single utterance without session state.
-**Request**:
-```json
-{
-  "utterance": "Will I need an umbrella in Bengaluru tomorrow?",
-  "context": "User timezone: Asia/Kolkata",
-  "final": true
-}
-```
-**Response**:
-```json
-{
-  "decision": "selected",
-  "confidence": 0.854,
-  "margin": 0.352,
-  "candidates": [
-    {
-      "tool": {
-        "id": "weather-service.get_forecast",
-        "server": "weather-service",
-        "name": "get_forecast",
-        "domain": "weather",
-        "description": "Domain: weather\nPurpose: Get forecast...",
-        "input_schema": {
-          "type": "object",
-          "properties": {
-            "location": { "type": "string" }
-          },
-          "required": ["location"]
-        }
-      },
-      "score": 0.854,
-      "lexical_score": 0.9,
-      "semantic_score": 0.8,
-      "rank": 1
-    }
-  ],
-  "reason": "top candidate passed confidence and margin thresholds",
-  "trace": {
-    "registry_version": 1,
-    "domains": ["weather"],
-    "domain_latency": 1500000,
-    "select_latency": 2500000,
-    "total_latency": 4000000,
-    "used_embeddings": true,
-    "used_reranker": false
-  }
-}
-```
-*(Note: Latency values in `trace` are represented in nanoseconds.)*
-
-#### `POST /v1/stream`
-Routes incremental user transcripts linked to a session.
-**Request**:
-```json
-{
-  "session_id": "session-101",
-  "transcript": "check the weather in Bengaluru",
-  "confidence": 0.91,
-  "final": false
-}
-```
-**Response**:
-```json
-{
-  "triggered": true,
-  "final": false,
-  "stable": true,
-  "stability_count": 2,
-  "result": {
-    "decision": "selected",
-    "confidence": 0.854,
-    "margin": 0.352,
-    "candidates": [
-      {
-        "tool": {
-          "id": "weather-service.get_forecast",
-          "server": "weather-service",
-          "name": "get_forecast",
-          "domain": "weather",
-          "description": "Domain: weather\nPurpose: Get forecast...",
-          "input_schema": {
-            "type": "object",
-            "properties": {
-              "location": { "type": "string" }
-            },
-            "required": ["location"]
-          }
-        },
-        "score": 0.854,
-        "lexical_score": 0.9,
-        "semantic_score": 0.8,
-        "rank": 1
-      }
-    ],
-    "reason": "top candidate passed confidence and margin thresholds",
-    "trace": {
-      "registry_version": 1,
-      "domains": ["weather"],
-      "domain_latency": 1500000,
-      "select_latency": 2500000,
-      "total_latency": 4000000,
-      "used_embeddings": true,
-      "used_reranker": false
-    }
-  }
-}
-```
-*(Note: Sending a request with `"final": true` automatically closes the session on the server; unused sessions expire after 2 minutes.)*
-## Production Deployment
-
-Deploy the Dynamic Router (`routerd`) as a sidecar container (e.g., in Kubernetes, ECS, or Docker Compose).
-
-### 🐳 Containerization
-
-Build the minimal Alpine-based image:
 ```bash
 docker build -t mcp-dynamic-router .
-```
-
-Run the container, mounting your `mcp.toml` configuration:
-```bash
 docker run -d -p 8090:8090 \
   -v $(pwd)/mcp.toml:/etc/routerd/mcp.toml:ro \
   mcp-dynamic-router \
   -listen 0.0.0.0:8090 -mcp /etc/routerd/mcp.toml
 ```
 
-Or run via [docker-compose.yml](file:///Users/kavin/Projects/MCP-Dynamic-router/docker-compose.yml):
+Or with `docker-compose.yml`:
 ```yaml
 services:
   routerd:
@@ -615,80 +302,23 @@ services:
     restart: unless-stopped
 ```
 
-### ⚙️ Best Practices
-* **Hot-Reloading**: The sidecar polls the `-mcp` file. Modifying it triggers a zero-downtime hot-reload of downstream connections.
-* **Health Checks**: Query `GET /healthz` for liveness and readiness probes.
-* **Security**: Bind to `127.0.0.1` (default) for local sidecars. Use an API gateway or reverse proxy for TLS/auth if exposing externally.
-* **Remote LLM / Embeddings**: Pass `-ollama http://ollama:11434` or implement custom Go `Embedder`/`Reranker` adapters to run cloud models (OpenAI, Gemini, Cohere) in production.
+---
+
+## 🧪 Testing & Verification
+
+```bash
+# Run all tests with race detector
+go test -race -v ./...
+
+# Static analysis
+go vet ./...
+
+# Benchmark BM25 inverted index
+go test -bench=. -benchmem ./router
+```
 
 ---
 
-## Integration Blueprints & Examples
-
-For real-time voice, streaming STT/ASR, and embedded application pipelines, you can find full runnable implementation blueprints under the `/examples` directory:
-
-* **Go Application Embed:** [main.go](examples/go_embed/main.go) — Demonstrates how to import the `dynamicrouter` library directly in Go, reload configurations, and run stateless `Route` or stateful `streamrag.Session` calls without a sidecar.
-* **Go Custom HTTP Gateway:** [main.go](examples/go_http_server/main.go) — Showcases how to build a custom Go HTTP JSON API server wrapping the dynamic router library (mini-`routerd`).
-* **Go Custom Embedder & Reranker:** [main.go](examples/go_custom_llm/main.go) — Detailed blueprints for writing and injecting custom implementations of the `router.Embedder` and `router.Reranker` interfaces (e.g. hooking in HuggingFace or OpenAI).
-* **Pipecat (Python):** [pipecat_router.py](examples/pipecat/pipecat_router.py) — Demonstrates how to pipe speech transcription updates to `routerd` to handle real-time prefetching and committed tool execution.
-* **LiveKit Agents (Python):** [livekit_agent.py](examples/livekit/livekit_agent.py) — Hook into user speech transcription and commitment events to stream partials and execute final tool decisions.
-* **OpenAI Realtime API (Python):** [openai_realtime_session.py](examples/openai_realtime/openai_realtime_session.py) — Interface with an OpenAI Realtime WebSockets session, intercepting `invoke_tool` intents and executing them via the sidecar.
-* **Gemini Multimodal Live API (Python):** [gemini_live.py](examples/gemini/gemini_live.py) — Interface with the Gemini Multimodal Live API via WebSockets using the `google-genai` SDK, mapping user intents to dynamic tool execution.
-* **Gemini SDK (Go):** [main.go](examples/gemini_go/main.go) — Demonstrates how to integrate standard Gemini function calling in Go using the official `google.golang.org/genai` SDK, routing calls through the embedded registry.
-
-## Repository map
-
-| Path | Responsibility |
-|---|---|
-| `dynamicrouter.go` | One-constructor Go facade. |
-| `router/` | Registry, audit, domain routing, selection, abstention, schema checks. |
-| `streamrag/` | Cancellable partial routing, stability, safe prefetch, final commit. |
-| `mcpclient/` | `mcp.toml`, official MCP SDK, hot discovery, execution. |
-| `embedding/` | Optional Ollama batch embeddings. |
-| `selector/` | Optional Ollama constrained-output reranker. |
-| `cmd/routerd/` | Provider-neutral HTTP sidecar. |
-| `cmd/router-audit/` | Description-quality CI gate. |
-| `cmd/router-eval/` | Accuracy, rejection, and latency evaluator. |
-
-## 🎯 Core Tenets
-
-* **Quality Descriptions:** Tool descriptions are treated as executable code, not decoration.
-* **Broad Retrieval, Narrow Reasoning:** Cast a wide net during stage-1 retrieval, then prune aggressively.
-* **Stream Safety:** Partial transcripts only prefetch safe read-only tools; they never authorize mutations.
-* **Safe Abstention:** We prefer returning `clarify` or `no_tool` over executing a confident wrong action.
-* **Separation of Policy:** Routing decisions and tool execution remain separate boundaries.
-* **Inspectable & Benchmarkable:** Every routing path and latency budget must be fully auditable.
-
-## 🚀 Roadmap
-
-* [ ] Public speech-routing benchmark & confusion-set generator.
-* [ ] Held-out confidence calibration.
-* [ ] Schema-constrained argument binder and self-repair loop.
-* [ ] Multi-intent dependency DAG with parallel execution.
-* [ ] Production integrations for LiveKit, Pipecat, OpenAI Realtime, and Gemini Live.
-* [ ] OpenTelemetry and Prometheus instrumentation.
-* [ ] Voxa integration with perceived-latency measurements.
-
-## 🤝 Contributing & Good First Issues
-
-We welcome contributions! Whether you want to add middleware telemetry, write new voice agent wrappers (e.g. for LiveKit or Pipecat), or implement new custom embedding caches, check out our [CONTRIBUTING.md](CONTRIBUTING.md) guide for details on how to get started.
-
-High-priority opportunities include:
-* **Prometheus & OpenTelemetry integrations** (adding latency and decision metrics).
-* **SQLite-backed embedding caching** (persisting vectors across restarts).
-* **Custom LLM adapters** (Hugging Face, Cohere, OpenAI).
-* **LiveKit / Pipecat adapter middlewares** in Python.
-
-To run verification commands:
-```bash
-go test -race ./...
-go vet ./...
-go run ./cmd/router-audit
-go run ./cmd/router-eval
-```
-
-Include benchmark impact with any ranking-policy change.
-
-## License
+## 📄 License
 
 MIT. See [LICENSE](LICENSE).

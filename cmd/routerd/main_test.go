@@ -82,7 +82,7 @@ func testAPI(t *testing.T) *api {
 	if err := app.Router.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	return &api{app: app, sessions: make(map[string]*streamEntry)}
+	return newAPI(app)
 }
 
 type jsonRPCRequest struct {
@@ -187,7 +187,7 @@ func TestExecuteEndpoint(t *testing.T) {
 		t.Fatalf("failed to refresh router: %v", err)
 	}
 
-	handler := &api{app: app, sessions: make(map[string]*streamEntry)}
+	handler := newAPI(app)
 
 	// 1. Test Successful Tool Execution via /v1/execute
 	reqBody := `{"tool_id":"weather.forecast","arguments":{"location":"Bengaluru"}}`
@@ -237,4 +237,105 @@ func TestExecuteEndpoint(t *testing.T) {
 		t.Fatalf("expected 404 Not Found for missing tool, got %d", recorder.Code)
 	}
 }
+
+func TestToolsEndpoint(t *testing.T) {
+	handler := testAPI(t)
+	defer handler.close()
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/tools", nil)
+	recorder := httptest.NewRecorder()
+	handler.tools(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", recorder.Code)
+	}
+
+	var res map[string]any
+	if err := json.NewDecoder(recorder.Body).Decode(&res); err != nil {
+		t.Fatal(err)
+	}
+	tools, ok := res["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("expected 1 registered tool in tools endpoint, got %+v", res)
+	}
+}
+
+func TestServersEndpoint(t *testing.T) {
+	handler := testAPI(t)
+	defer handler.close()
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/servers", nil)
+	recorder := httptest.NewRecorder()
+	handler.servers(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", recorder.Code)
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	handler := testAPI(t)
+	defer handler.close()
+
+	// Execute one route request to generate metric records
+	routeReq := httptest.NewRequest(http.MethodPost, "/v1/route", bytes.NewBufferString(`{"utterance":"weather forecast","final":true}`))
+	routeRec := httptest.NewRecorder()
+	handler.route(routeRec, routeReq)
+
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsRec := httptest.NewRecorder()
+	handler.metrics(metricsRec, metricsReq)
+
+	if metricsRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", metricsRec.Code)
+	}
+	body := metricsRec.Body.String()
+	if !bytes.Contains([]byte(body), []byte("mcp_router_requests_total")) {
+		t.Fatalf("expected prometheus metrics format, got: %s", body)
+	}
+	if !bytes.Contains([]byte(body), []byte("mcp_router_decisions_total")) {
+		t.Fatalf("expected decisions metrics in body, got: %s", body)
+	}
+}
+
+func TestHealthEndpoint(t *testing.T) {
+	handler := testAPI(t)
+	defer handler.close()
+
+	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	recorder := httptest.NewRecorder()
+	handler.health(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", recorder.Code)
+	}
+	var res map[string]any
+	if err := json.NewDecoder(recorder.Body).Decode(&res); err != nil {
+		t.Fatal(err)
+	}
+	if res["status"] != "ok" || res["tools_count"] != float64(1) {
+		t.Fatalf("unexpected health response: %+v", res)
+	}
+}
+
+func TestCORSMiddleware(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := withCORS(mux)
+
+	// Preflight request
+	optionsReq := httptest.NewRequest(http.MethodOptions, "/healthz", nil)
+	optionsRec := httptest.NewRecorder()
+	handler.ServeHTTP(optionsRec, optionsReq)
+
+	if optionsRec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content for OPTIONS, got %d", optionsRec.Code)
+	}
+	if optionsRec.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("expected CORS origin header, got %q", optionsRec.Header().Get("Access-Control-Allow-Origin"))
+	}
+}
+
 

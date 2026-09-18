@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"sort"
 	"sync"
 	"time"
@@ -16,10 +17,13 @@ import (
 )
 
 type Server struct {
-	Name       string       `toml:"name"`
-	URL        string       `toml:"url"`
-	Transport  string       `toml:"transport"`
-	HTTPClient *http.Client `toml:"-"`
+	Name       string            `toml:"name"`
+	URL        string            `toml:"url,omitempty"`
+	Transport  string            `toml:"transport"`
+	Command    string            `toml:"command,omitempty"`
+	Args       []string          `toml:"args,omitempty"`
+	Env        map[string]string `toml:"env,omitempty"`
+	HTTPClient *http.Client      `toml:"-"`
 }
 
 type ElicitationHandler func(context.Context, string, *mcp.ElicitRequest) (*mcp.ElicitResult, error)
@@ -94,6 +98,10 @@ func (c *Client) connectServers(ctx context.Context, configPath string) (Connect
 	if err != nil {
 		return ConnectReport{}, err
 	}
+	return c.connectConfig(ctx, config)
+}
+
+func (c *Client) connectConfig(ctx context.Context, config FileConfig) (ConnectReport, error) {
 	c.elicitation = config.Elicitation
 	report := ConnectReport{Failed: make(map[string]string)}
 	type connectResult struct {
@@ -131,15 +139,35 @@ func (c *Client) connectServers(ctx context.Context, configPath string) (Connect
 }
 
 func (c *Client) Connect(ctx context.Context, server Server) error {
-	if server.Name == "" || server.URL == "" {
-		return fmt.Errorf("server name and URL are required")
+	if server.Name == "" {
+		return fmt.Errorf("server name is required")
 	}
 	if server.Transport == "" {
 		server.Transport = "streamable-http"
 	}
-	if server.Transport != "streamable-http" && server.Transport != "http" {
-		return fmt.Errorf("server %q uses unsupported transport %q; use streamable-http", server.Name, server.Transport)
+	var transport mcp.Transport
+	switch server.Transport {
+	case "stdio":
+		if server.Command == "" {
+			return fmt.Errorf("server %q uses stdio transport but command is empty", server.Name)
+		}
+		cmd := exec.CommandContext(ctx, server.Command, server.Args...)
+		if len(server.Env) > 0 {
+			cmd.Env = append([]string(nil), os.Environ()...)
+			for k, v := range server.Env {
+				cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+			}
+		}
+		transport = &mcp.CommandTransport{Command: cmd}
+	case "streamable-http", "http":
+		if server.URL == "" {
+			return fmt.Errorf("server %q (%s) requires url", server.Name, server.Transport)
+		}
+		transport = &mcp.StreamableClientTransport{Endpoint: server.URL, HTTPClient: server.HTTPClient}
+	default:
+		return fmt.Errorf("server %q uses unsupported transport %q; use streamable-http or stdio", server.Name, server.Transport)
 	}
+
 	holder := &session{server: server}
 	client := mcp.NewClient(&mcp.Implementation{Name: c.clientName, Version: c.clientVersion}, &mcp.ClientOptions{
 		KeepAlive:          30 * time.Second,
@@ -148,7 +176,6 @@ func (c *Client) Connect(ctx context.Context, server Server) error {
 			go c.refreshAfterNotification(server.Name)
 		},
 	})
-	transport := &mcp.StreamableClientTransport{Endpoint: server.URL, HTTPClient: server.HTTPClient}
 	connected, err := client.Connect(ctx, transport, nil)
 	if err != nil {
 		return fmt.Errorf("connect %s: %w", server.Name, err)
@@ -306,15 +333,21 @@ func (c *Client) checkConfigChanges(ctx context.Context) {
 		return
 	}
 
+	// 1. Validate the modified config BEFORE terminating active connections!
+	newConfig, err := LoadConfig(path)
+	if err != nil {
+		log.Printf("[MCP Watcher] Config file %s modified but invalid (%v); keeping existing connections", path, err)
+		return
+	}
+
 	c.mu.Lock()
 	c.lastModTime = info.ModTime()
 	c.mu.Unlock()
 
-	log.Printf("[MCP Watcher] Config file %s modified; performing full hot-reload...", path)
+	log.Printf("[MCP Watcher] Config file %s modified; performing hot-reload for %d servers...", path, len(newConfig.Servers))
 	_ = c.closeSessions()
-	// Use connectServers instead of ConnectFile to avoid spawning a second watcher
-	// goroutine from inside the existing one. This goroutine IS the watcher.
-	_, reloadErr := c.connectServers(ctx, path)
+	// Use connectConfig instead of connectServers to avoid re-parsing the validated config
+	_, reloadErr := c.connectConfig(ctx, newConfig)
 	if reloadErr != nil {
 		log.Printf("[MCP Watcher] Reload failed for config %s: %v", path, reloadErr)
 	} else {
@@ -337,6 +370,17 @@ func (c *Client) get(serverName string) (*session, error) {
 		return nil, fmt.Errorf("MCP server %q is not connected", serverName)
 	}
 	return holder, nil
+}
+
+func (c *Client) ConnectedServers() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	servers := make([]string, 0, len(c.sessions))
+	for name := range c.sessions {
+		servers = append(servers, name)
+	}
+	sort.Strings(servers)
+	return servers
 }
 
 func (c *Client) refreshAfterNotification(serverName string) {

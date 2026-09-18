@@ -2,9 +2,11 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -95,6 +97,7 @@ func New(registry *Registry, embedder Embedder, cfg Config, options ...Option) *
 	for _, option := range options {
 		option(result)
 	}
+	result.loadEmbeddingCache()
 	return result
 }
 
@@ -163,6 +166,7 @@ func (r *Router) Refresh(ctx context.Context) error {
 				}
 			}
 			r.cacheMu.Unlock()
+			r.saveEmbeddingCache()
 		}
 
 		r.mu.Lock()
@@ -288,7 +292,9 @@ func (r *Router) routeSingle(ctx context.Context, request RouteRequest) (RouteRe
 	domainLexical := normalizeScores(index.domainLexical.scores(query))
 	domainSemantic, queryVector, usedEmbeddings, err := r.semanticScores(ctx, query, index.domainVectors)
 	if err != nil {
-		return RouteResult{}, err
+		log.Printf("[Router] Warning: semantic embedding failed (%v); falling back to lexical routing", err)
+		usedEmbeddings = false
+		domainSemantic = make([]float64, len(index.domainVectors))
 	}
 	lexicalWeight, semanticWeight := r.weights(usedEmbeddings)
 	domainScores := fuse(domainLexical, domainSemantic, lexicalWeight, semanticWeight)
@@ -306,6 +312,7 @@ func (r *Router) routeSingle(ctx context.Context, request RouteRequest) (RouteRe
 
 	selectStarted := time.Now()
 	toolScores := preliminaryToolScores
+	usedReranker := false
 	if r.reranker != nil {
 		shortlist := make([]Tool, 0, len(allowedTools))
 		for toolIndex := range allowedTools {
@@ -313,12 +320,14 @@ func (r *Router) routeSingle(ctx context.Context, request RouteRequest) (RouteRe
 		}
 		reranked, rerankErr := r.reranker.Rerank(ctx, request.Utterance, request.Context, shortlist)
 		if rerankErr != nil {
-			return RouteResult{}, fmt.Errorf("rerank shortlist: %w", rerankErr)
-		}
-		weight := math.Max(0, math.Min(1, r.cfg.RerankerWeight))
-		for toolIndex := range allowedTools {
-			if score, exists := reranked[index.tools[toolIndex].ID]; exists {
-				toolScores[toolIndex] = (1-weight)*toolScores[toolIndex] + weight*math.Max(0, math.Min(1, score))
+			log.Printf("[Router] Warning: reranker failed (%v); falling back to preliminary scores", rerankErr)
+		} else {
+			usedReranker = true
+			weight := math.Max(0, math.Min(1, r.cfg.RerankerWeight))
+			for toolIndex := range allowedTools {
+				if score, exists := reranked[index.tools[toolIndex].ID]; exists {
+					toolScores[toolIndex] = (1-weight)*toolScores[toolIndex] + weight*math.Max(0, math.Min(1, score))
+				}
 			}
 		}
 	}
@@ -341,7 +350,7 @@ func (r *Router) routeSingle(ctx context.Context, request RouteRequest) (RouteRe
 	selectLatency := time.Since(selectStarted)
 
 	result := decide(candidates, r.cfg)
-	result.Trace = Trace{RegistryVersion: index.version, Domains: selectedDomains, DomainLatency: domainLatency, SelectLatency: selectLatency, TotalLatency: time.Since(started), UsedEmbeddings: usedEmbeddings, UsedReranker: r.reranker != nil}
+	result.Trace = Trace{RegistryVersion: index.version, Domains: selectedDomains, DomainLatency: domainLatency, SelectLatency: selectLatency, TotalLatency: time.Since(started), UsedEmbeddings: usedEmbeddings, UsedReranker: usedReranker}
 	return result, nil
 }
 
@@ -406,8 +415,41 @@ func (r *Router) embedBatch(ctx context.Context, texts []string) ([][]float32, e
 			r.embedCache[misses[idx]] = vec
 		}
 		r.cacheMu.Unlock()
+		r.saveEmbeddingCache()
 	}
 	return results, nil
+}
+
+func (r *Router) loadEmbeddingCache() {
+	if r.cfg.EmbeddingCachePath == "" {
+		return
+	}
+	data, err := os.ReadFile(r.cfg.EmbeddingCachePath)
+	if err != nil {
+		return
+	}
+	var loaded map[string][]float32
+	if err := json.Unmarshal(data, &loaded); err == nil {
+		r.cacheMu.Lock()
+		for k, v := range loaded {
+			r.embedCache[k] = v
+		}
+		r.cacheMu.Unlock()
+		log.Printf("[Embedding Cache] Loaded %d vectors from %s", len(loaded), r.cfg.EmbeddingCachePath)
+	}
+}
+
+func (r *Router) saveEmbeddingCache() {
+	if r.cfg.EmbeddingCachePath == "" {
+		return
+	}
+	r.cacheMu.Lock()
+	data, err := json.Marshal(r.embedCache)
+	r.cacheMu.Unlock()
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(r.cfg.EmbeddingCachePath, data, 0o600)
 }
 
 func (r *Router) weights(semantic bool) (float64, float64) {

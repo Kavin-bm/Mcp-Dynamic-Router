@@ -182,3 +182,143 @@ func TestConcurrentRefreshCollapsesDuplicateEmbedCalls(t *testing.T) {
 	t.Logf("embed calls collapsed from %d goroutines to %d embedder call(s)", concurrency, calls)
 }
 
+func BenchmarkLexicalIndex_Scores(b *testing.B) {
+	// Setup a corpus of 100 tools
+	docs := make([]string, 100)
+	for i := 0; i < 100; i++ {
+		docs[i] = fmt.Sprintf("Domain: domain-%d. Purpose: Tool %d handles calculations, weather forecasts, calendar events, search queries, database lookups, and notifications. Invoke when: the user asks for action %d.", i%5, i, i)
+	}
+	index := newLexicalIndex(docs)
+	query := "check the weather forecast and calendar events for today"
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = index.scores(query)
+	}
+}
+
+func TestPersistentEmbeddingCache(t *testing.T) {
+	tempDir := t.TempDir()
+	cacheFile := tempDir + "/embeddings.json"
+
+	embedder := &mockEmbedder{vectorSize: 4}
+	registry := NewRegistry()
+	cfg := DefaultConfig()
+	cfg.EmbeddingCachePath = cacheFile
+
+	r1 := New(registry, embedder, cfg)
+	tool := Tool{ID: "calc.add", Name: "add", Server: "calc", Domain: "math", Description: "Add two numbers together", InputSchema: json.RawMessage(`{}`)}
+	if err := registry.ReplaceServer("calc", []Tool{tool}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r1.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	initialEmbeds := atomic.LoadInt64(&embedder.embeds)
+	if initialEmbeds == 0 {
+		t.Fatal("expected initial embeds to be greater than 0")
+	}
+
+	// Create a new router with the same cache file and registry snapshot
+	atomic.StoreInt64(&embedder.embeds, 0)
+	r2 := New(registry, embedder, cfg)
+	if err := r2.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	subsequentEmbeds := atomic.LoadInt64(&embedder.embeds)
+	if subsequentEmbeds != 0 {
+		t.Fatalf("expected 0 embeds from r2 due to persistent cache, got %d", subsequentEmbeds)
+	}
+}
+
+type failingEmbedder struct{}
+
+func (f *failingEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	return nil, fmt.Errorf("simulated network timeout")
+}
+
+func TestFailOpenSemanticRouting(t *testing.T) {
+	registry := NewRegistry()
+	tool := Tool{
+		ID:          "weather.forecast",
+		Name:        "get_forecast",
+		Server:      "weather",
+		Domain:      "weather",
+		Description: "Domain: weather. Purpose: Get weather forecast for city.",
+		InputSchema: json.RawMessage(`{}`),
+	}
+	if err := registry.ReplaceServer("weather", []Tool{tool}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Build index initially with a working mock embedder
+	embedder := &mockEmbedder{vectorSize: 4}
+	r := New(registry, embedder, DefaultConfig())
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now swap the embedder with a failing one
+	r.embedder = &failingEmbedder{}
+
+	// Routing should NOT return an error, but fail open to lexical BM25
+	result, err := r.Route(context.Background(), RouteRequest{
+		Utterance: "weather forecast",
+		Final:     true,
+	})
+	if err != nil {
+		t.Fatalf("expected fail-open to lexical, but got error: %v", err)
+	}
+	if result.Trace.UsedEmbeddings {
+		t.Fatal("expected UsedEmbeddings to be false when embedder fails")
+	}
+	if result.Decision != DecisionSelected || len(result.Candidates) == 0 {
+		t.Fatalf("expected tool selected via lexical fallback, got decision=%s", result.Decision)
+	}
+}
+
+type failingReranker struct{}
+
+func (f *failingReranker) Rerank(ctx context.Context, utterance, conversationContext string, tools []Tool) (map[string]float64, error) {
+	return nil, fmt.Errorf("simulated LLM reranker failure")
+}
+
+func TestFailOpenReranker(t *testing.T) {
+	registry := NewRegistry()
+	tool := Tool{
+		ID:          "weather.forecast",
+		Name:        "get_forecast",
+		Server:      "weather",
+		Domain:      "weather",
+		Description: "Domain: weather. Purpose: Get weather forecast for city.",
+		InputSchema: json.RawMessage(`{}`),
+	}
+	if err := registry.ReplaceServer("weather", []Tool{tool}); err != nil {
+		t.Fatal(err)
+	}
+
+	r := New(registry, nil, DefaultConfig(), WithReranker(&failingReranker{}))
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Routing should NOT return an error, but fail open to preliminary scores
+	result, err := r.Route(context.Background(), RouteRequest{
+		Utterance: "weather forecast",
+		Final:     true,
+	})
+	if err != nil {
+		t.Fatalf("expected fail-open to preliminary scores, but got error: %v", err)
+	}
+	if result.Trace.UsedReranker {
+		t.Fatal("expected UsedReranker to be false when reranker fails")
+	}
+	if result.Decision != DecisionSelected {
+		t.Fatalf("expected tool selected, got decision=%s", result.Decision)
+	}
+}
+
+

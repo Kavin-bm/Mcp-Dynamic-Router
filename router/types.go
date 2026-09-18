@@ -42,6 +42,7 @@ type Config struct {
 	DescriptionPolicy DescriptionPolicy
 	BM25FastPath      float64
 	RouteCacheTTL     time.Duration
+	EmbeddingCachePath string
 }
 
 func DefaultConfig() Config {

@@ -56,25 +56,42 @@ func stem(word string) string {
 	return word
 }
 
+type posting struct {
+	docIndex int
+	tf       int
+}
+
 type lexicalIndex struct {
-	documents [][]string
-	idf       map[string]float64
-	avgLength float64
+	documents     [][]string
+	docLengths    []int
+	invertedIndex map[string][]posting
+	idf           map[string]float64
+	avgLength     float64
 }
 
 func newLexicalIndex(texts []string) *lexicalIndex {
-	index := &lexicalIndex{idf: make(map[string]float64)}
+	index := &lexicalIndex{
+		documents:     make([][]string, 0, len(texts)),
+		docLengths:    make([]int, len(texts)),
+		invertedIndex: make(map[string][]posting),
+		idf:           make(map[string]float64),
+	}
 	documentFrequency := make(map[string]int)
-	for _, text := range texts {
+	for docIndex, text := range texts {
 		tokens := tokenize(text)
 		index.documents = append(index.documents, tokens)
+		index.docLengths[docIndex] = len(tokens)
 		index.avgLength += float64(len(tokens))
-		seen := make(map[string]struct{})
+		tfMap := make(map[string]int)
 		for _, token := range tokens {
-			seen[token] = struct{}{}
+			tfMap[token]++
 		}
-		for token := range seen {
+		for token, count := range tfMap {
 			documentFrequency[token]++
+			index.invertedIndex[token] = append(index.invertedIndex[token], posting{
+				docIndex: docIndex,
+				tf:       count,
+			})
 		}
 	}
 	if len(texts) > 0 {
@@ -87,24 +104,23 @@ func newLexicalIndex(texts []string) *lexicalIndex {
 }
 
 func (i *lexicalIndex) scores(query string) []float64 {
-	scores := make([]float64, len(i.documents))
-	if len(i.documents) == 0 || i.avgLength == 0 {
+	scores := make([]float64, len(i.docLengths))
+	if len(i.docLengths) == 0 || i.avgLength == 0 {
 		return scores
 	}
 	queryTokens := tokenize(query)
-	for docIndex, document := range i.documents {
-		frequency := make(map[string]int)
-		for _, token := range document {
-			frequency[token]++
+	const k1, b = 1.2, 0.75
+	for _, token := range queryTokens {
+		idf, exists := i.idf[token]
+		if !exists || idf <= 0 {
+			continue
 		}
-		for _, token := range queryTokens {
-			count := float64(frequency[token])
-			if count == 0 {
-				continue
-			}
-			const k1, b = 1.2, 0.75
-			denominator := count + k1*(1-b+b*float64(len(document))/i.avgLength)
-			scores[docIndex] += i.idf[token] * count * (k1 + 1) / denominator
+		postings := i.invertedIndex[token]
+		for _, p := range postings {
+			count := float64(p.tf)
+			docLen := float64(i.docLengths[p.docIndex])
+			denominator := count + k1*(1-b+b*docLen/i.avgLength)
+			scores[p.docIndex] += idf * count * (k1 + 1) / denominator
 		}
 	}
 	return scores

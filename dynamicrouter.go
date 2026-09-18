@@ -64,6 +64,8 @@ func (a *App) NewStream(options streamrag.Options, hooks streamrag.Hooks) *strea
 	return streamrag.New(a.Router, options, hooks)
 }
 
+func (a *App) ConnectedServers() []string { return a.MCP.ConnectedServers() }
+
 func (a *App) Close() error { return a.MCP.Close() }
 
 // ==========================================
@@ -113,6 +115,11 @@ func (b *AppBuilder) WithBM25FastPath(threshold float64) *AppBuilder {
 
 func (b *AppBuilder) WithRouteCacheTTL(ttl time.Duration) *AppBuilder {
 	b.routerConfig.RouteCacheTTL = ttl
+	return b
+}
+
+func (b *AppBuilder) WithEmbeddingCachePath(path string) *AppBuilder {
+	b.routerConfig.EmbeddingCachePath = path
 	return b
 }
 

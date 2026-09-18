@@ -91,3 +91,51 @@ transport = "streamable-http"
 		t.Fatal("expected config watcher to detect file modification and reload configurations")
 	}
 }
+
+func TestConfigWatcherNonDestructiveOnInvalidFile(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "mcp.toml")
+
+	initialContent := `
+[[servers]]
+name = "server-dummy"
+transport = "stdio"
+command = "echo"
+args = ["test"]
+`
+	if err := os.WriteFile(configPath, []byte(initialContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	registry := router.NewRegistry()
+	client := New(registry, nil)
+
+	// Populate an active session mock
+	client.mu.Lock()
+	client.sessions["server-dummy"] = &session{
+		server: Server{Name: "server-dummy", Transport: "stdio", Command: "echo"},
+	}
+	client.configPath = configPath
+	if info, err := os.Stat(configPath); err == nil {
+		client.lastModTime = info.ModTime()
+	}
+	client.mu.Unlock()
+
+	// Write completely broken/invalid TOML
+	time.Sleep(100 * time.Millisecond)
+	if err := os.WriteFile(configPath, []byte("NOT_VALID_TOML [[[[[["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Trigger checkConfigChanges
+	client.checkConfigChanges(context.Background())
+
+	// Verify that the existing session is preserved and NOT destroyed
+	client.mu.RLock()
+	activeSession, exists := client.sessions["server-dummy"]
+	client.mu.RUnlock()
+
+	if !exists || activeSession == nil {
+		t.Fatal("expected active session to remain preserved after invalid config was written")
+	}
+}

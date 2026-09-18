@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -40,9 +41,46 @@ type streamEntry struct {
 }
 
 type api struct {
-	app      *dynamicrouter.App
-	mu       sync.Mutex
-	sessions map[string]*streamEntry
+	app       *dynamicrouter.App
+	mu        sync.Mutex
+	sessions  map[string]*streamEntry
+	metricsMu sync.Mutex
+	requests  map[string]int64
+	decisions map[string]int64
+}
+
+func (a *api) recordRequest(endpoint string) {
+	a.metricsMu.Lock()
+	a.requests[endpoint]++
+	a.metricsMu.Unlock()
+}
+
+func (a *api) recordDecision(decision router.Decision) {
+	a.metricsMu.Lock()
+	a.decisions[string(decision)]++
+	a.metricsMu.Unlock()
+}
+
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func newAPI(app *dynamicrouter.App) *api {
+	return &api{
+		app:       app,
+		sessions:  make(map[string]*streamEntry),
+		requests:  make(map[string]int64),
+		decisions: make(map[string]int64),
+	}
 }
 
 func main() {
@@ -71,14 +109,24 @@ func main() {
 	}
 	log.Printf("MCP servers connected=%v failed=%v", report.Connected, report.Failed)
 
-	handler := &api{app: app, sessions: make(map[string]*streamEntry)}
+	handler := newAPI(app)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handler.health)
+	mux.HandleFunc("GET /metrics", handler.metrics)
+	mux.HandleFunc("GET /v1/tools", handler.tools)
+	mux.HandleFunc("GET /v1/servers", handler.servers)
 	mux.HandleFunc("POST /v1/route", handler.route)
 	mux.HandleFunc("POST /v1/stream", handler.stream)
 	mux.HandleFunc("POST /v1/execute", handler.execute)
 
-	server := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	server := &http.Server{
+		Addr:              *listen,
+		Handler:           withCORS(mux),
+		ReadHeaderTimeout: 3 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() {
 		log.Printf("routerd listening on http://%s", *listen)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -98,10 +146,87 @@ func main() {
 }
 
 func (a *api) health(response http.ResponseWriter, _ *http.Request) {
-	writeJSON(response, http.StatusOK, map[string]string{"status": "ok"})
+	a.recordRequest("/healthz")
+	snap := a.app.Registry.Snapshot()
+	servers := a.app.ConnectedServers()
+	writeJSON(response, http.StatusOK, map[string]any{
+		"status":            "ok",
+		"registry_version":  snap.Version,
+		"tools_count":       len(snap.Tools),
+		"connected_servers": servers,
+	})
+}
+
+func (a *api) tools(response http.ResponseWriter, _ *http.Request) {
+	a.recordRequest("/v1/tools")
+	snap := a.app.Registry.Snapshot()
+	writeJSON(response, http.StatusOK, map[string]any{
+		"version": snap.Version,
+		"count":   len(snap.Tools),
+		"tools":   snap.Tools,
+	})
+}
+
+func (a *api) servers(response http.ResponseWriter, _ *http.Request) {
+	a.recordRequest("/v1/servers")
+	servers := a.app.ConnectedServers()
+	writeJSON(response, http.StatusOK, map[string]any{
+		"count":   len(servers),
+		"servers": servers,
+	})
+}
+
+func (a *api) metrics(response http.ResponseWriter, _ *http.Request) {
+	a.recordRequest("/metrics")
+	a.metricsMu.Lock()
+	reqs := make(map[string]int64, len(a.requests))
+	for k, v := range a.requests {
+		reqs[k] = v
+	}
+	decs := make(map[string]int64, len(a.decisions))
+	for k, v := range a.decisions {
+		decs[k] = v
+	}
+	a.metricsMu.Unlock()
+
+	a.mu.Lock()
+	activeSessions := len(a.sessions)
+	a.mu.Unlock()
+
+	snap := a.app.Registry.Snapshot()
+	connectedServers := len(a.app.ConnectedServers())
+
+	var b strings.Builder
+	b.WriteString("# HELP mcp_router_requests_total Total number of HTTP requests processed\n")
+	b.WriteString("# TYPE mcp_router_requests_total counter\n")
+	endpoints := []string{"/healthz", "/metrics", "/v1/route", "/v1/stream", "/v1/execute", "/v1/tools", "/v1/servers"}
+	for _, ep := range endpoints {
+		fmt.Fprintf(&b, "mcp_router_requests_total{endpoint=%q} %d\n", ep, reqs[ep])
+	}
+	b.WriteString("\n# HELP mcp_router_decisions_total Routing decisions made by the router\n")
+	b.WriteString("# TYPE mcp_router_decisions_total counter\n")
+	for _, dec := range []string{"selected", "clarify", "no_tool"} {
+		fmt.Fprintf(&b, "mcp_router_decisions_total{decision=%q} %d\n", dec, decs[dec])
+	}
+	b.WriteString("\n# HELP mcp_router_active_sessions Number of active stream RAG sessions\n")
+	b.WriteString("# TYPE mcp_router_active_sessions gauge\n")
+	fmt.Fprintf(&b, "mcp_router_active_sessions %d\n", activeSessions)
+
+	b.WriteString("\n# HELP mcp_router_registered_tools Total tools loaded in registry\n")
+	b.WriteString("# TYPE mcp_router_registered_tools gauge\n")
+	fmt.Fprintf(&b, "mcp_router_registered_tools %d\n", len(snap.Tools))
+
+	b.WriteString("\n# HELP mcp_router_connected_servers Total active downstream MCP server connections\n")
+	b.WriteString("# TYPE mcp_router_connected_servers gauge\n")
+	fmt.Fprintf(&b, "mcp_router_connected_servers %d\n", connectedServers)
+
+	response.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	response.WriteHeader(http.StatusOK)
+	response.Write([]byte(b.String()))
 }
 
 func (a *api) route(response http.ResponseWriter, request *http.Request) {
+	a.recordRequest("/v1/route")
 	var input router.RouteRequest
 	if err := decodeJSON(response, request, &input); err != nil {
 		return
@@ -111,10 +236,12 @@ func (a *api) route(response http.ResponseWriter, request *http.Request) {
 		writeError(response, http.StatusInternalServerError, err)
 		return
 	}
+	a.recordDecision(result.Decision)
 	writeJSON(response, http.StatusOK, result)
 }
 
 func (a *api) stream(response http.ResponseWriter, request *http.Request) {
+	a.recordRequest("/v1/stream")
 	var input streamRequest
 	if err := decodeJSON(response, request, &input); err != nil {
 		return
@@ -133,6 +260,9 @@ func (a *api) stream(response http.ResponseWriter, request *http.Request) {
 		}
 		return
 	}
+	if prediction.Triggered {
+		a.recordDecision(prediction.Result.Decision)
+	}
 	if input.Final {
 		a.deleteSession(input.SessionID)
 	}
@@ -140,6 +270,7 @@ func (a *api) stream(response http.ResponseWriter, request *http.Request) {
 }
 
 func (a *api) execute(response http.ResponseWriter, request *http.Request) {
+	a.recordRequest("/v1/execute")
 	var input executeRequest
 	if err := decodeJSON(response, request, &input); err != nil {
 		return

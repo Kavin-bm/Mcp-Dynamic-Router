@@ -47,3 +47,42 @@ func TestLoadConfigRejectsSSE(t *testing.T) {
 		t.Fatal("expected deprecated SSE transport to be rejected")
 	}
 }
+
+func TestLoadConfigStdio(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "mcp.toml")
+	content := `
+[[servers]]
+name = "local-tool"
+transport = "stdio"
+command = "echo"
+args = ["hello", "world"]
+`
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("unexpected error loading stdio config: %v", err)
+	}
+	if len(cfg.Servers) != 1 || cfg.Servers[0].Transport != "stdio" || cfg.Servers[0].Command != "echo" {
+		t.Fatalf("unexpected stdio server parsed: %+v", cfg.Servers[0])
+	}
+	if len(cfg.Servers[0].Args) != 2 || cfg.Servers[0].Args[0] != "hello" {
+		t.Fatalf("unexpected stdio args: %+v", cfg.Servers[0].Args)
+	}
+}
+
+func TestLoadConfigStdioRequiresCommand(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "mcp.toml")
+	content := `
+[[servers]]
+name = "bad-stdio"
+transport = "stdio"
+`
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(configPath); err == nil {
+		t.Fatal("expected stdio server without command to fail validation")
+	}
+}
