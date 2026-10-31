@@ -16,6 +16,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: go test -race ./...
-      - run: go run ./cmd/router-audit
-      - run: go run ./cmd/router-eval
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...
+      - name: Tool description audit
+        run: go run ./cmd/router-audit
+      - name: Routing accuracy eval
+        run: go run ./cmd/router-eval -strict

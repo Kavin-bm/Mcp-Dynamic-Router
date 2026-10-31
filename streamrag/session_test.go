@@ -60,6 +60,26 @@ func TestFinalTranscriptAlwaysRoutesAndCommits(t *testing.T) {
 	}
 }
 
+func TestLowConfidencePartialIsIgnored(t *testing.T) {
+	session := New(testRouter(t), DefaultOptions(), Hooks{})
+	defer session.Close()
+	prediction, err := session.Update(context.Background(), Event{Transcript: "weather forecast Bengaluru", Confidence: 0.2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prediction.Triggered || prediction.Reason == "" {
+		t.Fatalf("low-confidence partial should be ignored: %+v", prediction)
+	}
+}
+
+func TestClosedSessionRejectsUpdates(t *testing.T) {
+	session := New(testRouter(t), DefaultOptions(), Hooks{})
+	session.Close()
+	if _, err := session.Update(context.Background(), Event{Transcript: "weather forecast Bengaluru", Final: true}); err == nil {
+		t.Fatal("expected a closed session to reject updates")
+	}
+}
+
 func TestShortPartialIsIgnored(t *testing.T) {
 	session := New(testRouter(t), DefaultOptions(), Hooks{})
 	defer session.Close()

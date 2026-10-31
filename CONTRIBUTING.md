@@ -11,10 +11,11 @@ Thank you for your interest in contributing to the MCP Dynamic Router project! W
 3. **Write Code and Tests** — please ensure your changes are fully covered by unit tests.
 4. **Run Verification Commands:**
    ```bash
-   go test -race ./...
+   go build ./...
    go vet ./...
+   go test -race ./...
    go run ./cmd/router-audit
-   go run ./cmd/router-eval
+   go run ./cmd/router-eval -strict
    ```
 5. **Submit a Pull Request (PR)** detailing the changes, design decisions, and benchmarks.
 
@@ -25,8 +26,8 @@ Thank you for your interest in contributing to the MCP Dynamic Router project! W
 We have flagged the following high-priority areas for new contributors to pick up:
 
 ### 1. Middleware & Telemetry
-* **Prometheus Integration:** Expose execution time, cache hit ratios, and routing margins.
-* **OpenTelemetry Middleware:** Add trace propagation across tool execution boundaries.
+* **Routing traces:** OpenTelemetry spans for each routing stage are optional and off by default. See the README for `routerd -tracing` and `MCP_ROUTER_TRACING`. A follow-up is to continue those traces across downstream tool execution.
+* **Prometheus histograms:** `/metrics` already exposes request and decision counters. Latency and margin histograms are still open.
 
 ### 2. Provider Adapters
 * **Python Framework Wrappers:** Write production-ready client wrappers for LiveKit Agents and Pipecat pipelines.

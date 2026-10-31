@@ -123,6 +123,13 @@ func (b *AppBuilder) WithEmbeddingCachePath(path string) *AppBuilder {
 	return b
 }
 
+// WithTracing turns on per-stage OpenTelemetry spans for Route. Export still
+// requires a TracerProvider; see the telemetry package and routerd -tracing.
+func (b *AppBuilder) WithTracing(enabled bool) *AppBuilder {
+	b.routerConfig.TracingEnabled = enabled
+	return b
+}
+
 func (b *AppBuilder) WithMinConfidence(confidence float64) *AppBuilder {
 	b.routerConfig.MinConfidence = confidence
 	return b

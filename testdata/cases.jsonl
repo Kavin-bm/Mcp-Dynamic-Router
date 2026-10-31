@@ -1,5 +1,9 @@
-{"utterance":"Will I need an umbrella in Bengaluru today?","expected_tool":"weather.get_forecast"}
-{"utterance":"What's the temperature in Mysuru?","expected_tool":"weather.get_forecast"}
-{"utterance":"Schedule lunch tomorrow at noon","context":"Timezone is Asia/Kolkata","expected_tool":"calendar.create_event"}
-{"utterance":"Add project review to my calendar Friday at 3 PM","expected_tool":"calendar.create_event"}
-{"utterance":"Tell me a bedtime story","expected_tool":""}
+{"utterance":"Will I need an umbrella in Bengaluru today?","expected_tool":"weather.get_forecast","expected_decision":"selected"}
+{"utterance":"What's the temperature in Mysuru?","expected_tool":"weather.get_forecast","expected_decision":"clarify"}
+{"utterance":"Schedule lunch tomorrow at noon","context":"Timezone is Asia/Kolkata","expected_tool":"calendar.create_event","expected_decision":"selected"}
+{"utterance":"Add project review to my calendar Friday at 3 PM","expected_tool":"calendar.create_event","expected_decision":"selected"}
+{"utterance":"Tell me a bedtime story","expected_tool":"","expected_decision":"no_tool"}
+{"utterance":"Is it raining in Mumbai right now?","expected_tool":"weather.get_forecast","expected_decision":"selected"}
+{"utterance":"Put a dentist appointment on my calendar next Tuesday at 9","expected_tool":"calendar.create_event","expected_decision":"selected"}
+{"utterance":"hello how are you","expected_tool":"","expected_decision":"no_tool"}
+{"utterance":"How windy is it in Chennai this evening?","expected_tool":"weather.get_forecast","expected_decision":"clarify"}
