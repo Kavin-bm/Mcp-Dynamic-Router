@@ -30,19 +30,25 @@ type Reranker interface {
 }
 
 type Config struct {
-	MaxDomainTools    int
-	DomainTopK        int
-	CandidateTopK     int
-	LexicalWeight     float64
-	SemanticWeight    float64
-	RerankerWeight    float64
-	MinConfidence     float64
-	MinMargin         float64
-	IncludeContext    bool
-	DescriptionPolicy DescriptionPolicy
-	BM25FastPath      float64
-	RouteCacheTTL     time.Duration
+	MaxDomainTools     int
+	DomainTopK         int
+	CandidateTopK      int
+	LexicalWeight      float64
+	SemanticWeight     float64
+	RerankerWeight     float64
+	MinConfidence      float64
+	MinMargin          float64
+	IncludeContext     bool
+	DescriptionPolicy  DescriptionPolicy
+	BM25FastPath       float64
+	RouteCacheTTL      time.Duration
 	EmbeddingCachePath string
+	// TracingEnabled emits one OpenTelemetry trace per Route call, with a
+	// child span for each routing stage. Off by default. The same traces are
+	// enabled when MCP_ROUTER_TRACING is 1, true, yes, or on. Spans are
+	// exported only after a TracerProvider is installed; cmd/routerd does
+	// that when tracing is turned on.
+	TracingEnabled bool
 }
 
 func DefaultConfig() Config {

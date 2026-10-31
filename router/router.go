@@ -12,7 +12,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -177,16 +179,37 @@ func (r *Router) Refresh(ctx context.Context) error {
 	return err
 }
 
-func (r *Router) Route(ctx context.Context, request RouteRequest) (RouteResult, error) {
+func (r *Router) Route(ctx context.Context, request RouteRequest) (result RouteResult, err error) {
+	ctx = r.withTracing(ctx)
+	var span traceSpan
+	ctx, span = r.startStage(ctx, spanRoute,
+		attribute.Int("router.utterance_chars", utf8.RuneCountInString(strings.TrimSpace(request.Utterance))),
+		attribute.Bool("router.has_context", strings.TrimSpace(request.Context) != ""),
+		attribute.Bool("router.final", request.Final),
+	)
+	defer func() {
+		if err == nil {
+			annotateResult(span, result)
+		}
+		finishSpan(span, err)
+	}()
+
 	query := strings.TrimSpace(request.Utterance)
 	contextStr := strings.TrimSpace(request.Context)
-	if cached, found := r.lookupRouteCache(query, contextStr); found {
-		return cached, nil
+	_, cacheSpan := r.startStage(ctx, spanCache)
+	cached, found := r.lookupRouteCache(query, contextStr)
+	if found {
+		setStageAttrs(cacheSpan, attribute.Bool(attrCacheHit, true))
+		finishSpan(cacheSpan, nil)
+		result = cached
+		return result, nil
 	}
+	setStageAttrs(cacheSpan, attribute.Bool(attrCacheHit, false))
+	finishSpan(cacheSpan, nil)
 
 	fragments := splitIntents(request.Utterance)
 	if len(fragments) <= 1 {
-		result, err := r.routeSingle(ctx, request)
+		result, err = r.routeSingle(ctx, request)
 		if err != nil {
 			return RouteResult{}, err
 		}
@@ -195,6 +218,9 @@ func (r *Router) Route(ctx context.Context, request RouteRequest) (RouteResult, 
 		}
 		return result, nil
 	}
+
+	_, splitSpan := r.startStage(ctx, spanIntent, attribute.Int("router.fragment_count", len(fragments)))
+	finishSpan(splitSpan, nil)
 
 	log.Printf("[Router] Multi-intent detected: %d fragments: %v", len(fragments), fragments)
 	results := make([]RouteResult, len(fragments))
@@ -211,8 +237,16 @@ func (r *Router) Route(ctx context.Context, request RouteRequest) (RouteResult, 
 			defer wg.Done()
 			req := request
 			req.Utterance = f
-			res, err := r.routeSingle(ctx, req)
-			ch <- routeJobResult{index: i, result: res, err: err}
+			fragCtx, fragSpan := r.startStage(ctx, spanFragment,
+				attribute.Int("router.fragment_index", i),
+				attribute.Int("router.utterance_chars", utf8.RuneCountInString(strings.TrimSpace(f))),
+			)
+			res, fragErr := r.routeSingle(fragCtx, req)
+			if fragErr == nil {
+				annotateResult(fragSpan, res)
+			}
+			finishSpan(fragSpan, fragErr)
+			ch <- routeJobResult{index: i, result: res, err: fragErr}
 		}(idx, frag)
 	}
 	wg.Wait()
@@ -224,11 +258,15 @@ func (r *Router) Route(ctx context.Context, request RouteRequest) (RouteResult, 
 		}
 		results[job.index] = job.result
 	}
+	_, mergeSpan := r.startStage(ctx, spanMerge, attribute.Int("router.fragment_count", len(results)))
 	merged := mergeRouteResults(results)
+	annotateResult(mergeSpan, merged)
+	finishSpan(mergeSpan, nil)
 	if merged.Decision != DecisionNoTool && r.cfg.RouteCacheTTL > 0 {
 		r.writeRouteCache(query, contextStr, merged, r.cfg.RouteCacheTTL)
 	}
-	return merged, nil
+	result = merged
+	return result, nil
 }
 
 func (r *Router) routeSingle(ctx context.Context, request RouteRequest) (RouteResult, error) {
@@ -244,7 +282,9 @@ func (r *Router) routeSingle(ctx context.Context, request RouteRequest) (RouteRe
 		query += " context " + request.Context
 	}
 	if query == "" {
-		return RouteResult{Decision: DecisionNoTool, Reason: "empty utterance"}, nil
+		result := RouteResult{Decision: DecisionNoTool, Reason: "empty utterance"}
+		r.finishDecide(ctx, result)
+		return result, nil
 	}
 
 	// Try BM25 Fast-Path
@@ -259,6 +299,7 @@ func (r *Router) routeSingle(ctx context.Context, request RouteRequest) (RouteRe
 			}
 		}
 
+		_, fastSpan := r.startStage(ctx, spanFastPath, attribute.Float64("router.bm25_threshold", r.cfg.BM25FastPath))
 		if bestIdx != -1 && bestScore >= r.cfg.BM25FastPath {
 			bestTool := index.tools[bestIdx]
 			candidate := Candidate{
@@ -284,13 +325,41 @@ func (r *Router) routeSingle(ctx context.Context, request RouteRequest) (RouteRe
 					UsedReranker:    false,
 				},
 			}
+			setStageAttrs(fastSpan,
+				attribute.Bool(attrFastPath, true),
+				attribute.Float64("router.bm25_score", bestScore),
+				attribute.String("router.tool_id", bestTool.ID),
+			)
+			annotateResult(fastSpan, result)
+			finishSpan(fastSpan, nil)
+			r.finishDecide(ctx, result)
 			return result, nil
 		}
+		recorded := bestScore
+		if bestIdx == -1 {
+			recorded = 0
+		}
+		setStageAttrs(fastSpan, attribute.Bool(attrFastPath, false), attribute.Float64("router.bm25_score", recorded))
+		finishSpan(fastSpan, nil)
 	}
 
 	domainStarted := time.Now()
+	domainCtx, domainSpan := r.startStage(ctx, spanDomain)
 	domainLexical := normalizeScores(index.domainLexical.scores(query))
-	domainSemantic, queryVector, usedEmbeddings, err := r.semanticScores(ctx, query, index.domainVectors)
+	var embedSpan traceSpan
+	if r.embedder != nil && len(index.domainVectors) > 0 {
+		_, embedSpan = r.startStage(domainCtx, spanEmbed)
+	}
+	domainSemantic, queryVector, usedEmbeddings, err := r.semanticScores(domainCtx, query, index.domainVectors)
+	if embedSpan != nil {
+		if err != nil {
+			setStageAttrs(embedSpan, attribute.Bool("router.embedding_fallback", true))
+			finishSpan(embedSpan, err)
+		} else {
+			setStageAttrs(embedSpan, attribute.Bool("router.used_embeddings", usedEmbeddings))
+			finishSpan(embedSpan, nil)
+		}
+	}
 	if err != nil {
 		log.Printf("[Router] Warning: semantic embedding failed (%v); falling back to lexical routing", err)
 		usedEmbeddings = false
@@ -309,8 +378,16 @@ func (r *Router) routeSingle(ctx context.Context, request RouteRequest) (RouteRe
 	preliminaryToolScores := fuse(toolLexical, toolSemantic, lexicalWeight, semanticWeight)
 	selectedDomains, allowedTools := r.selectDomains(index, domainRanks, preliminaryToolScores)
 	domainLatency := time.Since(domainStarted)
+	setStageAttrs(domainSpan,
+		attribute.Int("router.domain_count", len(selectedDomains)),
+		attribute.StringSlice("router.selected_domains", selectedDomains),
+		attribute.Int("router.domain_tool_count", len(allowedTools)),
+		attribute.Bool("router.used_embeddings", usedEmbeddings),
+	)
+	finishSpan(domainSpan, nil)
 
 	selectStarted := time.Now()
+	selectCtx, selectSpan := r.startStage(ctx, spanSelect)
 	toolScores := preliminaryToolScores
 	usedReranker := false
 	if r.reranker != nil {
@@ -318,8 +395,11 @@ func (r *Router) routeSingle(ctx context.Context, request RouteRequest) (RouteRe
 		for toolIndex := range allowedTools {
 			shortlist = append(shortlist, index.tools[toolIndex])
 		}
-		reranked, rerankErr := r.reranker.Rerank(ctx, request.Utterance, request.Context, shortlist)
+		_, rerankSpan := r.startStage(selectCtx, spanRerank, attribute.Int(attrCandidateCount, len(shortlist)))
+		reranked, rerankErr := r.reranker.Rerank(selectCtx, request.Utterance, request.Context, shortlist)
 		if rerankErr != nil {
+			setStageAttrs(rerankSpan, attribute.Bool("router.reranker_fallback", true))
+			finishSpan(rerankSpan, rerankErr)
 			log.Printf("[Router] Warning: reranker failed (%v); falling back to preliminary scores", rerankErr)
 		} else {
 			usedReranker = true
@@ -329,6 +409,7 @@ func (r *Router) routeSingle(ctx context.Context, request RouteRequest) (RouteRe
 					toolScores[toolIndex] = (1-weight)*toolScores[toolIndex] + weight*math.Max(0, math.Min(1, score))
 				}
 			}
+			finishSpan(rerankSpan, nil)
 		}
 	}
 	candidates := make([]Candidate, 0, len(allowedTools))
@@ -351,7 +432,17 @@ func (r *Router) routeSingle(ctx context.Context, request RouteRequest) (RouteRe
 
 	result := decide(candidates, r.cfg)
 	result.Trace = Trace{RegistryVersion: index.version, Domains: selectedDomains, DomainLatency: domainLatency, SelectLatency: selectLatency, TotalLatency: time.Since(started), UsedEmbeddings: usedEmbeddings, UsedReranker: usedReranker}
+	setStageAttrs(selectSpan, attribute.Bool("router.used_reranker", usedReranker), attribute.Bool("router.used_embeddings", usedEmbeddings))
+	annotateResult(selectSpan, result)
+	finishSpan(selectSpan, nil)
+	r.finishDecide(ctx, result)
 	return result, nil
+}
+
+func (r *Router) finishDecide(ctx context.Context, result RouteResult) {
+	_, decideSpan := r.startStage(ctx, spanDecide)
+	annotateResult(decideSpan, result)
+	finishSpan(decideSpan, nil)
 }
 
 func (r *Router) semanticScores(ctx context.Context, query string, vectors [][]float32) ([]float64, []float32, bool, error) {

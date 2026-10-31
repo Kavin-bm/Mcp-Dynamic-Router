@@ -10,6 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
 	dynamicrouter "github.com/kavinbm16/mcp-dynamic-router"
 	"github.com/kavinbm16/mcp-dynamic-router/mcpclient"
 	"github.com/kavinbm16/mcp-dynamic-router/router"
@@ -318,6 +322,59 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestRouteEndpointEmitsStageSpans(t *testing.T) {
+	t.Setenv("MCP_ROUTER_TRACING", "1")
+	rec := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	previous := otel.GetTracerProvider()
+	otel.SetTracerProvider(provider)
+	t.Cleanup(func() {
+		otel.SetTracerProvider(previous)
+		_ = provider.Shutdown(context.Background())
+	})
+
+	handler := testAPI(t)
+	defer handler.close()
+	handler.tracing = true
+	request := httptest.NewRequest(http.MethodPost, "/v1/route", bytes.NewBufferString(`{"utterance":"weather forecast Bengaluru","final":true}`))
+	recorder := httptest.NewRecorder()
+	handler.route(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var result router.RouteResult
+	if err := json.NewDecoder(recorder.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+
+	var httpSpan, routeSpan sdktrace.ReadOnlySpan
+	for _, span := range rec.Ended() {
+		switch span.Name() {
+		case "routerd.route":
+			httpSpan = span
+		case "router.route":
+			routeSpan = span
+		}
+	}
+	if httpSpan == nil || routeSpan == nil {
+		t.Fatalf("expected routerd.route and router.route spans, got %d ended spans", len(rec.Ended()))
+	}
+	if routeSpan.Parent().SpanID() != httpSpan.SpanContext().SpanID() {
+		t.Fatal("router.route should be a child of routerd.route")
+	}
+	var margin float64
+	var sawMargin bool
+	for _, kv := range routeSpan.Attributes() {
+		if string(kv.Key) == "router.margin" {
+			margin = kv.Value.AsFloat64()
+			sawMargin = true
+		}
+	}
+	if !sawMargin || margin != result.Margin {
+		t.Fatalf("span margin=%v ok=%v result margin=%v", margin, sawMargin, result.Margin)
+	}
+}
+
 func TestCORSMiddleware(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -337,5 +394,3 @@ func TestCORSMiddleware(t *testing.T) {
 		t.Fatalf("expected CORS origin header, got %q", optionsRec.Header().Get("Access-Control-Allow-Origin"))
 	}
 }
-
-

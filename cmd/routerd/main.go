@@ -15,11 +15,17 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
 	dynamicrouter "github.com/kavinbm16/mcp-dynamic-router"
 	"github.com/kavinbm16/mcp-dynamic-router/embedding"
 	"github.com/kavinbm16/mcp-dynamic-router/router"
 	"github.com/kavinbm16/mcp-dynamic-router/selector"
 	"github.com/kavinbm16/mcp-dynamic-router/streamrag"
+	"github.com/kavinbm16/mcp-dynamic-router/telemetry"
 )
 
 type streamRequest struct {
@@ -42,6 +48,7 @@ type streamEntry struct {
 
 type api struct {
 	app       *dynamicrouter.App
+	tracing   bool
 	mu        sync.Mutex
 	sessions  map[string]*streamEntry
 	metricsMu sync.Mutex
@@ -89,9 +96,24 @@ func main() {
 	ollamaURL := flag.String("ollama", "", "optional Ollama base URL")
 	embeddingModel := flag.String("embedding-model", "", "optional Ollama embedding model")
 	selectorModel := flag.String("selector-model", "", "optional Ollama tool-selector model")
+	tracing := flag.Bool("tracing", false, "emit OpenTelemetry spans for each routing stage (off by default; also enabled by MCP_ROUTER_TRACING=1|true|yes|on)")
 	flag.Parse()
 
 	options := dynamicrouter.Options{MCPConfigPath: *mcpConfig, RouterConfig: router.DefaultConfig()}
+	if *tracing || telemetry.Enabled() {
+		options.RouterConfig.TracingEnabled = true
+		shutdownTracing, err := telemetry.Setup(context.Background())
+		if err != nil {
+			log.Fatalf("tracing: %v", err)
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := shutdownTracing(ctx); err != nil {
+				log.Printf("tracing shutdown: %v", err)
+			}
+		}()
+	}
 	if *embeddingModel != "" {
 		options.Embedder = &embedding.Ollama{BaseURL: *ollamaURL, Model: *embeddingModel}
 	}
@@ -110,6 +132,7 @@ func main() {
 	log.Printf("MCP servers connected=%v failed=%v", report.Connected, report.Failed)
 
 	handler := newAPI(app)
+	handler.tracing = options.RouterConfig.TracingEnabled
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handler.health)
 	mux.HandleFunc("GET /metrics", handler.metrics)
@@ -227,14 +250,26 @@ func (a *api) metrics(response http.ResponseWriter, _ *http.Request) {
 
 func (a *api) route(response http.ResponseWriter, request *http.Request) {
 	a.recordRequest("/v1/route")
+	ctx, span := a.startHTTPSpan(request, "routerd.route")
+	defer endHTTPSpan(span)
 	var input router.RouteRequest
 	if err := decodeJSON(response, request, &input); err != nil {
+		recordHTTPError(span, err)
 		return
 	}
-	result, err := a.app.Route(request.Context(), input)
+	result, err := a.app.Route(ctx, input)
 	if err != nil {
+		recordHTTPError(span, err)
 		writeError(response, http.StatusInternalServerError, err)
 		return
+	}
+	if span != nil {
+		span.SetAttributes(
+			attribute.String("router.decision", string(result.Decision)),
+			attribute.Int("router.candidate_count", len(result.Candidates)),
+			attribute.Float64("router.top_score", result.Confidence),
+			attribute.Float64("router.margin", result.Margin),
+		)
 	}
 	a.recordDecision(result.Decision)
 	writeJSON(response, http.StatusOK, result)
@@ -242,23 +277,37 @@ func (a *api) route(response http.ResponseWriter, request *http.Request) {
 
 func (a *api) stream(response http.ResponseWriter, request *http.Request) {
 	a.recordRequest("/v1/stream")
+	ctx, span := a.startHTTPSpan(request, "routerd.stream")
+	defer endHTTPSpan(span)
 	var input streamRequest
 	if err := decodeJSON(response, request, &input); err != nil {
+		recordHTTPError(span, err)
 		return
 	}
 	if input.SessionID == "" {
-		writeError(response, http.StatusBadRequest, fmt.Errorf("session_id is required"))
+		err := fmt.Errorf("session_id is required")
+		recordHTTPError(span, err)
+		writeError(response, http.StatusBadRequest, err)
 		return
 	}
 	session := a.getSession(input.SessionID)
-	prediction, err := session.Update(request.Context(), streamrag.Event{Transcript: input.Transcript, Context: input.Context, Final: input.Final, Confidence: input.Confidence})
+	prediction, err := session.Update(ctx, streamrag.Event{Transcript: input.Transcript, Context: input.Context, Final: input.Final, Confidence: input.Confidence})
 	if err != nil {
+		recordHTTPError(span, err)
 		if errors.Is(err, context.Canceled) {
 			writeError(response, http.StatusConflict, fmt.Errorf("superseded by a newer transcript"))
 		} else {
 			writeError(response, http.StatusInternalServerError, err)
 		}
 		return
+	}
+	if span != nil && prediction.Triggered {
+		span.SetAttributes(
+			attribute.String("router.decision", string(prediction.Result.Decision)),
+			attribute.Int("router.candidate_count", len(prediction.Result.Candidates)),
+			attribute.Float64("router.top_score", prediction.Result.Confidence),
+			attribute.Float64("router.margin", prediction.Result.Margin),
+		)
 	}
 	if prediction.Triggered {
 		a.recordDecision(prediction.Result.Decision)
@@ -303,6 +352,29 @@ func (a *api) execute(response http.ResponseWriter, request *http.Request) {
 		return
 	}
 	writeJSON(response, http.StatusOK, result)
+}
+
+const routerdTracer = "github.com/kavinbm16/mcp-dynamic-router/cmd/routerd"
+
+func (a *api) startHTTPSpan(request *http.Request, name string) (context.Context, trace.Span) {
+	if !a.tracing {
+		return request.Context(), nil
+	}
+	ctx := otel.GetTextMapPropagator().Extract(request.Context(), propagation.HeaderCarrier(request.Header))
+	return otel.Tracer(routerdTracer).Start(ctx, name)
+}
+
+func endHTTPSpan(span trace.Span) {
+	if span != nil {
+		span.End()
+	}
+}
+
+func recordHTTPError(span trace.Span, err error) {
+	if span == nil || err == nil {
+		return
+	}
+	span.RecordError(err)
 }
 
 func (a *api) getSession(id string) *streamrag.Session {
